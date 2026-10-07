@@ -724,15 +724,21 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
                                        email_addr: str, screenshot_path) -> str | None:
     """在已登录 Claude 的页面打开授权链接 → 点 Authorize → 抓回跳的授权码。"""
     logger.info(f"打开授权链接: {auth_url}")
-    await page.goto(auth_url, wait_until="domcontentloaded")
+    try:
+        await page.goto(auth_url, wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        logger.warning(f"打开授权链接超时/失败: {e}，当前 URL={page.url}，继续尝试抓码")
     await page.wait_for_timeout(2000)
     await page.screenshot(path=screenshot_path("bind_authorize", email_addr))
+    logger.info(f"授权页已加载 URL: {page.url}")
 
     authorize_btn = (
         'button:has-text("Authorize"), button:has-text("授权"), '
         'button:has-text("Allow"), button:has-text("Approve"), '
         'button:has-text("Continue"), a:has-text("Authorize")'
     )
+    last_url = ""
+    clicked = False
     for i in range(90):  # 最长约 180s
         # 1) 回跳 URL 里直接带 code
         code = _extract_oauth_code_from_url(page.url, pending_state)
@@ -744,17 +750,35 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
         if code:
             logger.info("已从页面抓到授权码")
             return code
+
+        cur = page.url
+        if cur != last_url:
+            logger.info(f"授权中... ({(i+1)*2}s) URL: {cur}")
+            last_url = cur
+
         # 3) 点授权按钮（已跳到 callback 后页面上不会再有，自然跳过）
         try:
             btn = page.locator(authorize_btn)
             if await btn.count() > 0 and await btn.first.is_visible():
                 await btn.first.click()
                 logger.info("已点击授权按钮")
+                clicked = True
                 await page.wait_for_timeout(2500)
                 continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"点击授权按钮异常: {e}")
+
+        # 未找到可点按钮且还没点过 → 周期性打印页面按钮文案 + 截图，便于排查
+        if not clicked and i in (2, 10, 30, 60):
+            try:
+                btn_texts = [t.strip() for t in await page.locator("button").all_inner_texts() if t.strip()]
+                logger.warning(f"⚠️  授权页未找到授权按钮（{(i+1)*2}s），按钮文案: {btn_texts}")
+            except Exception as e:
+                logger.debug(f"收集授权页按钮文案失败: {e}")
+            await page.screenshot(path=screenshot_path(f"bind_authorize_wait_{(i+1)*2}s", email_addr))
+
         await page.wait_for_timeout(2000)
+    logger.warning(f"授权码抓取超时（180s），最终 URL={page.url}")
     await page.screenshot(path=screenshot_path("bind_no_code", email_addr))
     return None
 
