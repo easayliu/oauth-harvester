@@ -151,6 +151,7 @@ def print_help():
   common          对比两个文件，找共同/差异邮箱（支持纯文本、CSV 等任意格式）
                   python main.py common a.txt b.csv
                   --only-a  --only-b  --out result.txt
+                  --with-pass  匹配邮箱带密码输出（邮箱----密码）
 
   suspend         批量检查邮箱是否被封禁 → suspended.txt / normal.txt
                   python main.py suspend accounts.txt
@@ -166,6 +167,10 @@ def print_help():
 
   disabled        从 OAuth admin API 拉取已停用账号 → disabled_emails.txt
                   python main.py disabled
+
+  disabled-unproxy 把所有已停用账号的出站代理改为"无代理"(PATCH outbound_proxy_id=null)
+                  python main.py disabled-unproxy [--dry-run] [-y]
+                  --dry-run 仅预览  -y/--yes 跳过确认
 
 ═══ SSH 远程 ═══
 

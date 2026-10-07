@@ -720,9 +720,50 @@ async def _extract_oauth_code_from_page(page, pending_state: str) -> str | None:
     return m.group(1) if m else None
 
 
+class _ReauthRequired(Exception):
+    """打开 OAuth authorize 时被 Claude 强制登出/要求重新登录（involuntary logout）。
+
+    触发条件：authorize 页回跳到 /logout?involuntary=1 或 /login?...reauth=1。
+    此时页面已不是授权同意页，继续在上面找/点按钮只会误点登录页按钮并空转超时，
+    故上抛由调用方走「重新登录 → 重试授权」。"""
+
+
+def _is_reauth_url(url: str) -> bool:
+    u = (url or "").lower()
+    # authorize 正常流程只会停在 claude.ai/oauth/authorize 或回跳到 console.anthropic.com；
+    # 一旦出现 logout / 登录页 / reauth 标记，即为被强制重新登录。
+    return (
+        "/logout" in u
+        or "involuntary=1" in u
+        or "reauth=1" in u
+        or "claude.ai/login" in u
+    )
+
+
+class _AccountOnHold(Exception):
+    """账号被 Claude 封禁/冻结（account_on_hold / restricted / access_denied）。
+
+    登录或授权回跳到 .../oauth/code/callback?error=access_denied&
+    error_description=account_on_hold&error_uri=.../restricted 时触发，
+    该账号无法继续，应直接跳过（不再等待、不再重试）。"""
+
+
+def _is_account_restricted_url(url: str) -> bool:
+    u = (url or "").lower()
+    return (
+        "account_on_hold" in u
+        or "account_restricted" in u
+        or "error=access_denied" in u
+        or "claude.ai/restricted" in u
+        or "/restricted" in u
+    )
+
+
 async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
                                        email_addr: str, screenshot_path) -> str | None:
-    """在已登录 Claude 的页面打开授权链接 → 点 Authorize → 抓回跳的授权码。"""
+    """在已登录 Claude 的页面打开授权链接 → 点 Authorize → 抓回跳的授权码。
+
+    若 authorize 被强制登出（involuntary logout / reauth）抛 _ReauthRequired。"""
     logger.info(f"打开授权链接: {auth_url}")
     try:
         await page.goto(auth_url, wait_until="domcontentloaded", timeout=45000)
@@ -732,14 +773,27 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
     await page.screenshot(path=screenshot_path("bind_authorize", email_addr))
     logger.info(f"授权页已加载 URL: {page.url}")
 
+    # 授权同意页上的按钮；只在 /oauth/authorize 同意页才点，避免误点登录页的
+    # "Continue with email" 等按钮（曾因 Continue 太宽导致误点登录页并空转 180s）。
     authorize_btn = (
         'button:has-text("Authorize"), button:has-text("授权"), '
         'button:has-text("Allow"), button:has-text("Approve"), '
-        'button:has-text("Continue"), a:has-text("Authorize")'
+        'a:has-text("Authorize")'
     )
     last_url = ""
     clicked = False
     for i in range(90):  # 最长约 180s
+        # 0a) 账号被 hold/restricted → 立即上抛，直接跳过该账号
+        if _is_account_restricted_url(page.url):
+            logger.warning(f"授权时账号被 hold/restricted，当前 URL={page.url}")
+            await page.screenshot(path=screenshot_path("bind_account_on_hold", email_addr))
+            raise _AccountOnHold()
+        # 0b) 被强制登出 / 跳回登录页 → 立即上抛，由上层重登后重试，别在登录页空转
+        if _is_reauth_url(page.url):
+            logger.warning(f"授权被强制重新登录（involuntary logout），当前 URL={page.url}")
+            await page.screenshot(path=screenshot_path("bind_reauth", email_addr))
+            raise _ReauthRequired()
+
         # 1) 回跳 URL 里直接带 code
         code = _extract_oauth_code_from_url(page.url, pending_state)
         if code:
@@ -756,15 +810,16 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
             logger.info(f"授权中... ({(i+1)*2}s) URL: {cur}")
             last_url = cur
 
-        # 3) 点授权按钮（已跳到 callback 后页面上不会再有，自然跳过）
+        # 3) 点授权按钮（仅限 /oauth/authorize 同意页；跳到 callback 后页面上不会再有）
         try:
-            btn = page.locator(authorize_btn)
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click()
-                logger.info("已点击授权按钮")
-                clicked = True
-                await page.wait_for_timeout(2500)
-                continue
+            if "/oauth/authorize" in page.url:
+                btn = page.locator(authorize_btn)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click()
+                    logger.info("已点击授权按钮")
+                    clicked = True
+                    await page.wait_for_timeout(2500)
+                    continue
         except Exception as e:
             logger.debug(f"点击授权按钮异常: {e}")
 
@@ -784,25 +839,53 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
 
 
 async def _bind_account_to_backend(page, email_addr: str, screenshot_path,
-                                   admin_token: str = None) -> bool:
+                                   admin_token: str = None, relogin=None) -> bool:
     """claude-email 登录成功后：拉授权链接 → 浏览器授权 → exchange 落库。返回是否成功。
 
     admin_token: 命令行 --admin-token= 传入的后台 access_token（非 vendor 账号），
     优先级高于 config 里的 OAUTH_ADMIN_API_TOKEN / REFRESH_TOKEN。
+    relogin: 可选的 async 重登回调；authorize 被强制登出（involuntary logout）时，
+    先重登一次再重新拉授权链接重试，最多重试一次。
     """
     from app.accounts import oauth_bind
 
     tok_kw = {"token": admin_token} if admin_token else {}
-    try:
+
+    async def _authorize_once():
+        """拉一次全新授权链接并抓码；被强制登出时抛 _ReauthRequired。"""
         auth_url, pending_state = await asyncio.to_thread(
             lambda: oauth_bind.get_auth_url(**tok_kw))
+        logger.info(f"pending_state={pending_state}")
+        code = await _oauth_authorize_and_capture(
+            page, auth_url, pending_state, email_addr, screenshot_path)
+        return code, pending_state
+
+    try:
+        try:
+            code, pending_state = await _authorize_once()
+        except _ReauthRequired:
+            if not relogin:
+                logger.warning("授权被强制重新登录，且无重登回调，跳过绑定")
+                print("\n[bind] 授权时被强制重新登录（involuntary logout），已跳过加入后台。\n")
+                return False
+            logger.info("授权被强制重新登录，正在用邮箱 magic-link 重新登录后重试授权...")
+            if not await relogin():
+                logger.warning("重新登录失败，跳过绑定")
+                print("\n[bind] 重新登录失败，已跳过加入后台。\n")
+                return False
+            try:
+                code, pending_state = await _authorize_once()
+            except _ReauthRequired:
+                logger.warning("重新登录后授权仍被强制登出，跳过绑定")
+                print("\n[bind] 重新登录后仍被强制登出（账号可能异常），已跳过加入后台。\n")
+                return False
+    except _AccountOnHold:
+        raise  # 账号被 hold：上抛由单账号流程统一记录并跳过
     except Exception as e:
         logger.error(f"获取授权链接失败: {e}")
         print(f"\n[bind] 获取授权链接失败: {e}\n")
         return False
-    logger.info(f"pending_state={pending_state}")
 
-    code = await _oauth_authorize_and_capture(page, auth_url, pending_state, email_addr, screenshot_path)
     if not code:
         logger.warning("未抓到授权码，跳过 exchange")
         print("\n[bind] 未抓到授权码（可能授权页结构变化或未完成授权），浏览器保留可手动完成。\n")
@@ -862,7 +945,8 @@ async def _claude_profile_logged_in(page, context) -> bool:
 
 
 async def _claude_extract_session_and_bind(page, context, email_addr, app_password,
-                                           bind_after, admin_token, screenshot_path) -> bool:
+                                           bind_after, admin_token, screenshot_path,
+                                           relogin=None) -> bool:
     """提取 sessionKey（写入 session.txt），需要时再执行加入后台。已登录/新登录两条路径共用。
 
     返回该账号是否「整体成功」：claude-email 以拿到 sessionKey 为准；
@@ -892,13 +976,164 @@ async def _claude_extract_session_and_bind(page, context, email_addr, app_passwo
     if bind_after:
         if session_key:
             logger.info("开始把账号加入 oauth-accounts 后台...")
-            bound = await _bind_account_to_backend(page, email_addr, screenshot_path, admin_token)
+            bound = await _bind_account_to_backend(
+                page, email_addr, screenshot_path, admin_token, relogin=relogin)
             return bool(bound)
         else:
             logger.warning("未登录成功（无 sessionKey），跳过加入后台")
             print("\n[bind] 未登录成功，跳过加入后台。\n")
             return False
     return bool(session_key)
+
+
+async def _claude_email_magic_login(page, email_addr, app_password, imap_host, imap_port,
+                                    *, delete_after=False, interactive=True) -> bool:
+    """邮箱 magic-link 登录：打开 /login → 填邮箱提交 → IMAP 抓 magic link → 打开 →
+    推进注册引导直到进入 /new。首登与 reauth 重登共用。
+
+    返回 True 表示 magic link 已成功打开（调用方可继续提取 sessionKey）；
+    返回 False 为硬失败（没找到输入框 / 没抓到登录链接），应中止。"""
+    from app.core.browser import human_delay, screenshot_path as _screenshot_path
+    from app.accounts.claude import _claude_advance_onboarding
+
+    # 抓本次登录前的收件箱基准 UID（紧挨提交，确保只认新到的登录邮件）
+    baseline_uid = await asyncio.to_thread(
+        _imap_latest_uid, imap_host, imap_port, email_addr, app_password)
+    logger.info(f"收件箱基准 UID={baseline_uid}")
+
+    # 1. 打开 Claude 登录页（SPA + 代理下 domcontentloaded 易超时，用 commit 提速）
+    logger.info("正在打开 claude.ai/login...")
+    try:
+        await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
+    except Exception as e:
+        logger.warning(f"打开 claude.ai/login 超时/失败，重试一次: {e}")
+        await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
+    await human_delay(page, "navigate")
+    await page.screenshot(path=_screenshot_path("email_landing", email_addr))
+
+    # 2. 等待邮箱输入框出现并填写
+    email_input = page.locator(
+        'input[type="email"], input[name="email"], '
+        'input[placeholder*="email" i], input[placeholder*="Email" i]'
+    )
+    for _ in range(15):
+        if await email_input.count() > 0 and await email_input.first.is_visible():
+            break
+        await page.wait_for_timeout(1000)
+    if await email_input.count() > 0:
+        await email_input.first.fill(email_addr)
+        await human_delay(page, "type")
+        logger.info(f"已填写邮箱: {email_addr}")
+    else:
+        logger.error("未找到邮箱输入框")
+        await page.screenshot(path=_screenshot_path("email_no_input", email_addr))
+        if interactive and sys.stdin.isatty():
+            input("未找到邮箱输入框，按回车键关闭浏览器...")
+        return False
+
+    # 3. 点击 "Continue with email"（严格匹配，避免误点 Google/Apple）
+    submit_btn = page.locator(
+        'button:has-text("Continue with email"), '
+        'button:has-text("Continue with login link")'
+    )
+    for _ in range(5):
+        if await submit_btn.count() > 0 and await submit_btn.first.is_visible():
+            break
+        await page.wait_for_timeout(1000)
+    if await submit_btn.count() > 0:
+        await submit_btn.first.click()
+        await human_delay(page, "click")
+        logger.info("已点击 'Continue with email'")
+    else:
+        logger.warning("未找到 'Continue with email'，尝试 type=submit 兜底")
+        fallback = page.locator('button[type="submit"]')
+        if await fallback.count() > 0:
+            await fallback.first.click()
+            await human_delay(page, "click")
+    await page.screenshot(path=_screenshot_path("email_submitted", email_addr))
+
+    # 4. 后台 IMAP 轮询抓 magic link
+    logger.info("等待登录邮件（最长 5 分钟）...")
+    magic_link = await asyncio.to_thread(
+        _imap_wait_new_magic_link, imap_host, imap_port, email_addr, app_password,
+        baseline_uid, 300, 6, "anthropic", "link", delete_after,
+    )
+    if not magic_link:
+        logger.warning("未抓到登录链接")
+        await page.screenshot(path=_screenshot_path("email_no_link", email_addr))
+        if interactive and sys.stdin.isatty():
+            input("未抓到登录链接，按回车键关闭浏览器...")
+        return False
+
+    # 5. 在原页面打开 magic link（同一 context，cookie 共享）
+    logger.info("抓到登录链接，在原页面打开...")
+    try:
+        await page.goto(magic_link, wait_until="commit", timeout=45000)
+    except Exception as e:
+        logger.warning(f"打开 magic link 超时/失败，重试一次: {e}")
+        await page.goto(magic_link, wait_until="commit", timeout=45000)
+    await human_delay(page, "navigate")
+    await page.screenshot(path=_screenshot_path("email_magic_link", email_addr))
+
+    # 6. 等待登录完成 + 自动推进注册引导
+    last_url = ""
+    unrecognized_streak = 0
+    manual_warned = False
+    for i in range(120):
+        await page.wait_for_timeout(3000)
+        current_url = page.url
+        # 账号被 hold/restricted（access_denied / account_on_hold）→ 立即跳过，别空等
+        if _is_account_restricted_url(current_url):
+            logger.warning(f"账号被 hold/restricted，URL={current_url}")
+            await page.screenshot(path=_screenshot_path("account_on_hold", email_addr))
+            raise _AccountOnHold()
+        if "claude.ai/new" in current_url or "claude.ai/chat" in current_url:
+            logger.info(f"已进入 Claude 对话页面！URL: {current_url}")
+            break
+
+        if current_url != last_url:
+            logger.info(f"等待登录完成... ({(i+1)*3}s) URL: {current_url}")
+            last_url = current_url
+
+        try:
+            action = await _claude_advance_onboarding(page, email_addr)
+        except Exception as e:
+            logger.debug(f"onboarding 推进异常: {e}")
+            action = ""
+        if action:
+            logger.info(f"自动通过注册引导: {action}")
+            unrecognized_streak = 0
+            continue
+
+        terms_btn = page.locator(
+            'button:has-text("Accept"), button:has-text("Agree"), '
+            'button:has-text("接受"), button:has-text("同意")'
+        )
+        if await terms_btn.count() > 0 and await terms_btn.first.is_visible():
+            await terms_btn.first.click()
+            await human_delay(page, "click")
+            unrecognized_streak = 0
+            continue
+
+        if "signup" in current_url or "register" in current_url or "onboarding" in current_url:
+            unrecognized_streak += 1
+            if unrecognized_streak == 3 and not manual_warned:
+                logger.warning(
+                    f"⚠️  未识别的注册/引导页面 URL={current_url}，已截图 "
+                    f"claude_needs_manual_*，继续等待（共 {(i+1)*3}s）"
+                )
+                await page.screenshot(path=_screenshot_path("claude_needs_manual", email_addr))
+                try:
+                    btn_texts = await page.locator("button").all_inner_texts()
+                    visible_btns = [t.strip() for t in btn_texts if t.strip()]
+                    logger.warning(f"   当前页面按钮文案: {visible_btns}")
+                except Exception as e:
+                    logger.debug(f"收集按钮文案失败: {e}")
+                manual_warned = True
+            elif unrecognized_streak % 10 == 0:
+                await page.screenshot(
+                    path=_screenshot_path(f"claude_needs_manual_{unrecognized_streak*3}s", email_addr))
+    return True
 
 
 async def run_claude_email(mode: str, raw_input: str, is_file: bool):
@@ -1011,16 +1246,11 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
 
     from app.core.browser import (
         get_kiro_profile_dir,
-        human_delay,
         launch_camoufox_persistent_context,
         close_camoufox_persistent_context,
         screenshot_path as _screenshot_path,
     )
-    from app.accounts.claude import _claude_advance_onboarding
-
-    baseline_uid = await asyncio.to_thread(
-        _imap_latest_uid, imap_host, imap_port, email_addr, app_password)
-    logger.info(f"收件箱基准 UID={baseline_uid}")
+    # 登录步骤与基准 UID 已下沉到 _claude_email_magic_login，这里不再预抓 UID
 
     # 用持久化 context（按邮箱账号隔离 profile），cookie 跨 tab/跨次复用
     profile_dir = get_kiro_profile_dir(email_addr, browser="firefox")
@@ -1036,6 +1266,13 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
         try:
             page = context.pages[0] if context.pages else await context.new_page()
 
+            # relogin 回调：授权被强制登出（involuntary logout）时，重新 magic-link
+            # 登录一次再重试授权。非交互，避免批量时卡在等回车。
+            async def _relogin():
+                return await _claude_email_magic_login(
+                    page, email_addr, app_password, imap_host, imap_port,
+                    delete_after=delete_after, interactive=False)
+
             # 0. 已登录检测：该 profile 已登录 claude 则跳过整个邮箱 magic link 登录，
             #    直接提取 sessionKey（并按需加入后台）。
             logger.info("检测该 profile 是否已登录 Claude...")
@@ -1043,7 +1280,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 logger.info("该 profile 已登录 Claude，跳过邮箱登录流程")
                 success = await _claude_extract_session_and_bind(
                     page, context, email_addr, app_password,
-                    bind_after, admin_token, _screenshot_path)
+                    bind_after, admin_token, _screenshot_path, relogin=_relogin)
                 if interactive and sys.stdin.isatty():
                     try:
                         input("流程结束，按回车键关闭浏览器...")
@@ -1051,150 +1288,26 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                         pass
                 return success
 
-            # 1. 打开 Claude 登录页
-            #    claude.ai 是重前端 SPA，叠加代理时 domcontentloaded 常要十几二十秒、
-            #    易超默认 30s 超时。只需导航 commit（服务器响应一到）即可，后面本就
-            #    轮询等待邮箱输入框出现，故用 wait_until="commit" 提速并抬高超时。
-            logger.info("正在打开 claude.ai/login...")
-            try:
-                await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
-            except Exception as e:
-                logger.warning(f"打开 claude.ai/login 超时/失败，重试一次: {e}")
-                await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
-            await human_delay(page, "navigate")
-            await page.screenshot(path=_screenshot_path("email_landing", email_addr))
-
-            # 2. 等待邮箱输入框出现并填写
-            #    claude.ai/login 页面布局：Google / Apple / OR / 邮箱输入框 / Continue with email
-            #    输入框和提交按钮同屏显示，无需先点击展开
-            email_input = page.locator(
-                'input[type="email"], input[name="email"], '
-                'input[placeholder*="email" i], input[placeholder*="Email" i]'
-            )
-            for _ in range(15):
-                if await email_input.count() > 0 and await email_input.first.is_visible():
-                    break
-                await page.wait_for_timeout(1000)
-            if await email_input.count() > 0:
-                await email_input.first.fill(email_addr)
-                await human_delay(page, "type")
-                logger.info(f"已填写邮箱: {email_addr}")
-            else:
-                logger.error("未找到邮箱输入框")
-                await page.screenshot(path=_screenshot_path("email_no_input", email_addr))
-                if interactive and sys.stdin.isatty():
-                    input("未找到邮箱输入框，按回车键关闭浏览器...")
+            # 1~7. 邮箱 magic-link 登录（填邮箱 → 抓链接 → 打开 → 推进引导直到 /new）
+            if not await _claude_email_magic_login(
+                    page, email_addr, app_password, imap_host, imap_port,
+                    delete_after=delete_after, interactive=interactive):
                 return False
-
-            # 3. 点击 "Continue with email"（严格匹配，避免误点 Google/Apple）
-            submit_btn = page.locator(
-                'button:has-text("Continue with email"), '
-                'button:has-text("Continue with login link")'
-            )
-            for _ in range(5):
-                if await submit_btn.count() > 0 and await submit_btn.first.is_visible():
-                    break
-                await page.wait_for_timeout(1000)
-            if await submit_btn.count() > 0:
-                await submit_btn.first.click()
-                await human_delay(page, "click")
-                logger.info("已点击 'Continue with email'")
-            else:
-                logger.warning("未找到 'Continue with email'，尝试 type=submit 兜底")
-                fallback = page.locator('button[type="submit"]')
-                if await fallback.count() > 0:
-                    await fallback.first.click()
-                    await human_delay(page, "click")
-            await page.screenshot(path=_screenshot_path("email_submitted", email_addr))
-
-            # 5. 后台 IMAP 轮询抓 magic link
-            logger.info("等待登录邮件（最长 5 分钟）...")
-            magic_link = await asyncio.to_thread(
-                _imap_wait_new_magic_link, imap_host, imap_port, email_addr, app_password,
-                baseline_uid, 300, 6, "anthropic", "link", delete_after,
-            )
-
-            if not magic_link:
-                logger.warning("未抓到登录链接")
-                await page.screenshot(path=_screenshot_path("email_no_link", email_addr))
-                if interactive and sys.stdin.isatty():
-                    input("未抓到登录链接，按回车键关闭浏览器...")
-                return False
-
-            # 6. 在原页面打开 magic link（同一 context，cookie 共享）
-            #    同样用 commit + 抬高超时，避免重前端/代理下 domcontentloaded 卡满默认 30s。
-            logger.info(f"抓到登录链接，在原页面打开...")
-            try:
-                await page.goto(magic_link, wait_until="commit", timeout=45000)
-            except Exception as e:
-                logger.warning(f"打开 magic link 超时/失败，重试一次: {e}")
-                await page.goto(magic_link, wait_until="commit", timeout=45000)
-            await human_delay(page, "navigate")
-            await page.screenshot(path=_screenshot_path("email_magic_link", email_addr))
-
-            # 7. 等待登录完成 + 自动推进注册引导
-            last_url = ""
-            unrecognized_streak = 0
-            manual_warned = False
-            for i in range(120):
-                await page.wait_for_timeout(3000)
-                current_url = page.url
-                if "claude.ai/new" in current_url or "claude.ai/chat" in current_url:
-                    logger.info(f"已进入 Claude 对话页面！URL: {current_url}")
-                    break
-
-                if current_url != last_url:
-                    logger.info(f"等待登录完成... ({(i+1)*3}s) URL: {current_url}")
-                    last_url = current_url
-
-                try:
-                    action = await _claude_advance_onboarding(page, email_addr)
-                except Exception as e:
-                    logger.debug(f"onboarding 推进异常: {e}")
-                    action = ""
-                if action:
-                    logger.info(f"自动通过注册引导: {action}")
-                    unrecognized_streak = 0
-                    continue
-
-                terms_btn = page.locator(
-                    'button:has-text("Accept"), button:has-text("Agree"), '
-                    'button:has-text("接受"), button:has-text("同意")'
-                )
-                if await terms_btn.count() > 0 and await terms_btn.first.is_visible():
-                    await terms_btn.first.click()
-                    await human_delay(page, "click")
-                    unrecognized_streak = 0
-                    continue
-
-                # 仍停留在 signup/onboarding 但识别不出来 → 截图+日志（便于排查）
-                if "signup" in current_url or "register" in current_url or "onboarding" in current_url:
-                    unrecognized_streak += 1
-                    if unrecognized_streak == 3 and not manual_warned:
-                        logger.warning(
-                            f"⚠️  未识别的注册/引导页面 URL={current_url}，已截图 "
-                            f"claude_needs_manual_*，继续等待（共 {(i+1)*3}s）"
-                        )
-                        await page.screenshot(
-                            path=_screenshot_path("claude_needs_manual", email_addr))
-                        try:
-                            btn_texts = await page.locator("button").all_inner_texts()
-                            visible_btns = [t.strip() for t in btn_texts if t.strip()]
-                            logger.warning(f"   当前页面按钮文案: {visible_btns}")
-                        except Exception as e:
-                            logger.debug(f"收集按钮文案失败: {e}")
-                        manual_warned = True
-                    # 每 30s 再补一张，观察页面是否有变化
-                    elif unrecognized_streak % 10 == 0:
-                        await page.screenshot(
-                            path=_screenshot_path(
-                                f"claude_needs_manual_{unrecognized_streak*3}s", email_addr))
 
             # 8. 提取 sessionKey（并按需加入后台）
             success = await _claude_extract_session_and_bind(
                 page, context, email_addr, app_password,
-                bind_after, admin_token, _screenshot_path)
+                bind_after, admin_token, _screenshot_path, relogin=_relogin)
 
+        except _AccountOnHold:
+            logger.warning(f"账号被 hold/restricted，直接跳过: {email_addr}")
+            print(f"\n[skip] 账号被 hold/restricted（account_on_hold），已跳过: {email_addr}\n")
+            try:
+                with open("hold_accounts.txt", "a") as f:
+                    f.write(f"{email_addr}----{app_password}\n")
+            except Exception:
+                pass
+            success = False
         except Exception as e:
             logger.error(f"执行过程中出错: {e}")
             try:

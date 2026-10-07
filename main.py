@@ -39,7 +39,8 @@ MODES = ("password", "claude", "password-claude", "session", "batch", "extract",
          "import-kiro", "aws", "aws-diag", "aws-quota", "aws-extract",
          "aws-claude", "aws-kiro", "aws-kiro-bind", "aws-newapi",
          "subus", "oauth", "bedrock", "overage", "openai", "chrome", "yahoo", "email",
-         "claude-mail", "claude-email", "claude-bind", "chatgpt-mail", "emails", "disabled", "common")
+         "claude-mail", "claude-email", "claude-bind", "chatgpt-mail", "emails", "disabled",
+         "disabled-unproxy", "common")
 
 # 全量 mode -> handler；claude/aws/kiro/password 仅文件批量时走这里，否则落到单条流程
 FILE_ONLY = {"claude": claude_modes.run_claude_batch,
@@ -79,6 +80,7 @@ HANDLERS = {"oauth": subus_modes.run_oauth,
             "chatgpt-mail": browser_modes.run_chatgpt_mail,
             "yahoo": lambda mode, raw, is_file: asyncio.get_event_loop().run_in_executor(None, yahoo_imap_inbox, raw),
             "disabled": text_modes.run_disabled,
+            "disabled-unproxy": text_modes.run_disabled_unproxy,
             "common": text_modes.run_common}
 
 

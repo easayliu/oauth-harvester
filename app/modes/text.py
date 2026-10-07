@@ -340,6 +340,8 @@ async def run_common(mode: str, raw_input: str, is_file: bool):
         print("    --out <path>    结果写到文件（默认打印到终端）")
         print("    --only-a        只输出在 A 中有、B 中没有的邮箱")
         print("    --only-b        只输出在 B 中有、A 中没有的邮箱")
+        print("    --with-pass     匹配到的邮箱带上密码一起输出（邮箱----密码，")
+        print("                    密码从 email----password 格式的文件里取）")
         exit(1)
 
     file_a = sys.argv[2]
@@ -359,16 +361,38 @@ async def run_common(mode: str, raw_input: str, is_file: bool):
         out_path = extra[i + 1]
     only_a = "--only-a" in extra
     only_b = "--only-b" in extra
+    with_pass = "--with-pass" in extra
 
     email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    # 识别 email----password / email:password / email,password 等成对格式
+    pair_re = re.compile(
+        r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"
+        r"\s*(?:----|:|\||,|\t)\s*(\S+)"
+    )
 
     def _extract_emails(path: str) -> set[str]:
         with open(path, "r") as fh:
             text = fh.read()
         return {m.lower() for m in email_re.findall(text)}
 
+    def _extract_pairs(path: str) -> dict[str, str]:
+        """返回 {邮箱小写: 密码}，只收 email<分隔符>password 形式的行。"""
+        pairs: dict[str, str] = {}
+        with open(path, "r") as fh:
+            for line in fh:
+                m = pair_re.search(line)
+                if m:
+                    pairs.setdefault(m.group(1).lower(), m.group(2))
+        return pairs
+
     set_a = _extract_emails(file_a)
     set_b = _extract_emails(file_b)
+
+    pw_map: dict[str, str] = {}
+    if with_pass:
+        # B 优先（通常密码库是第二个文件），A 补齐
+        pw_map = _extract_pairs(file_a)
+        pw_map.update(_extract_pairs(file_b))
 
     name_a = os.path.basename(file_a)
     name_b = os.path.basename(file_b)
@@ -388,14 +412,29 @@ async def run_common(mode: str, raw_input: str, is_file: bool):
     print(f"交集: {len(set_a & set_b)}  仅A: {len(set_a - set_b)}  仅B: {len(set_b - set_a)}")
     print(f"\n--- {label} ({len(result)}) ---")
 
-    output = "\n".join(result) + ("\n" if result else "")
+    if with_pass:
+        lines = []
+        missing = 0
+        for e in result:
+            pw = pw_map.get(e)
+            if pw:
+                lines.append(f"{e}----{pw}")
+            else:
+                lines.append(e)
+                missing += 1
+        if missing:
+            print(f"（{missing} 个邮箱没找到对应密码，只输出邮箱）")
+    else:
+        lines = list(result)
+
+    output = "\n".join(lines) + ("\n" if lines else "")
     if out_path:
         with open(out_path, "w") as fh:
             fh.write(output)
         print(f"已写到 {out_path}")
     else:
-        for e in result:
-            print(f"  {e}")
+        for ln in lines:
+            print(f"  {ln}")
     return
 
 
@@ -467,34 +506,67 @@ def _oauth_admin_request(base_url: str, path: str, token: str,
         raise RuntimeError(f"请求失败 [{status}]: {err_text[:500]}")
 
 
-# disabled 模式：从 oauth-accounts admin API 获取已停用的账号
-async def run_disabled(mode: str, raw_input: str, is_file: bool):
+def _oauth_admin_write(base_url: str, path: str, token: str, body: dict,
+                       refresh_token: str = "", method: str = "PATCH") -> tuple:
+    """向 oauth admin API 发写请求（默认 PATCH），返回 (parsed_json_or_None, raw_text)。
+    token 过期（401）时用 refresh_token 刷新后自动重试一次。"""
+    url = f"{base_url}{path}"
+    data = json.dumps(body).encode("utf-8")
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if token:
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        headers["Authorization"] = f"Bearer {token}"
+    if refresh_token:
+        headers["Cookie"] = f"refresh_token={refresh_token}"
+
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(text), text
+            except json.JSONDecodeError:
+                return None, text
+    except urllib.error.HTTPError as e:
+        status = e.code
+        err_text = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
+        if status == 401 and refresh_token:
+            new_token = _oauth_admin_refresh(base_url, refresh_token)
+            if new_token:
+                return _oauth_admin_write(base_url, path, new_token, body, "", method)
+        raise RuntimeError(f"请求失败 [{status}]: {err_text[:500]}")
+
+
+def _resolve_admin_tokens(raw_input: str):
+    """统一解析 admin API 的 access_token / refresh_token / base_url（disabled 系模式共用）。
+    返回 (base_url, access_token, refresh_token)；缺凭据时打印用法并退出。"""
     refresh_token = OAUTH_ADMIN_API_REFRESH_TOKEN
     access_token = OAUTH_ADMIN_API_TOKEN
-
-    # 命令行参数覆盖
-    if raw_input.strip():
-        access_token = raw_input.strip()
+    # 命令行第一个非 -- 开头的参数视为 bearer token 覆盖
+    arg_tok = raw_input.strip()
+    if arg_tok and not arg_tok.startswith("--"):
+        access_token = arg_tok
 
     if not access_token and not refresh_token:
-        print("用法: python main.py disabled [bearer_token]")
-        print("  在 config.py 中配置（推荐 refresh_token，有效期 7 天）:")
+        print("需要后台 admin API 凭据。在 config.py 中配置（推荐 refresh_token，有效期 7 天）:")
         print('    OAUTH_ADMIN_API_REFRESH_TOKEN = "eyJ..."')
         print("  或配置 access_token（有效期 15 分钟）:")
         print('    OAUTH_ADMIN_API_TOKEN = "eyJ..."')
         exit(1)
 
     base_url = OAUTH_ADMIN_API_BASE_URL.rstrip("/")
-
-    # 如果只有 refresh_token 没有 access_token，先刷新一次
     if not access_token and refresh_token:
         logger.info("无 access_token，使用 refresh_token 刷新...")
         access_token = _oauth_admin_refresh(base_url, refresh_token)
         if not access_token:
             print("refresh_token 刷新失败，请检查 token 是否过期")
             exit(1)
+    return base_url, access_token, refresh_token
 
-    # 分页拉取已停用账号
+
+def _fetch_disabled_accounts(base_url: str, access_token: str, refresh_token: str):
+    """分页拉取全部已停用账号，返回 (accounts_list, api_total)。"""
     page = 1
     page_size = 100
     all_disabled = []
@@ -512,14 +584,8 @@ async def run_disabled(mode: str, raw_input: str, is_file: bool):
             "sort": "created_at",
             "direction": "desc",
         }
-        try:
-            data, raw = _oauth_admin_request(base_url, "/api/admin/oauth-accounts",
-                                              access_token, refresh_token, params)
-        except RuntimeError as e:
-            print(str(e))
-            exit(1)
-
-        # 解析响应
+        data, raw = _oauth_admin_request(base_url, "/api/admin/oauth-accounts",
+                                          access_token, refresh_token, params)
         if isinstance(data, dict):
             accounts = data.get("data") or data.get("accounts") or []
             total_accounts = data.get("total", total_accounts)
@@ -527,18 +593,27 @@ async def run_disabled(mode: str, raw_input: str, is_file: bool):
             accounts = data
             total_accounts = len(accounts)
         else:
-            print(f"无法解析响应: {raw[:500]}")
-            exit(1)
+            raise RuntimeError(f"无法解析响应: {raw[:500]}")
 
         if not accounts:
             break
-
         all_disabled.extend(accounts)
         logger.info(f"第 {page} 页: 获取 {len(accounts)} 条（累计 {len(all_disabled)}）")
-
         if len(accounts) < page_size:
             break
         page += 1
+    return all_disabled, total_accounts
+
+
+# disabled 模式：从 oauth-accounts admin API 获取已停用的账号
+async def run_disabled(mode: str, raw_input: str, is_file: bool):
+    base_url, access_token, refresh_token = _resolve_admin_tokens(raw_input)
+    try:
+        all_disabled, total_accounts = _fetch_disabled_accounts(
+            base_url, access_token, refresh_token)
+    except RuntimeError as e:
+        print(str(e))
+        exit(1)
 
     print("\n" + "=" * 60)
     print("OAuth 已停用账号查询")
@@ -576,5 +651,87 @@ async def run_disabled(mode: str, raw_input: str, is_file: bool):
         print(f"已停用邮箱列表已保存到 {emails_file}（{len(emails)} 个）")
     else:
         print("\n未发现已停用的账号。")
+    print("=" * 60)
+    return
+
+
+# disabled-unproxy 模式：把所有已停用账号的出站代理改为“无代理”(outbound_proxy_id=null)
+async def run_disabled_unproxy(mode: str, raw_input: str, is_file: bool):
+    args = sys.argv[2:]
+    dry_run = "--dry-run" in args
+    assume_yes = ("--yes" in args) or ("-y" in args)
+
+    base_url, access_token, refresh_token = _resolve_admin_tokens(raw_input)
+    try:
+        all_disabled, total_accounts = _fetch_disabled_accounts(
+            base_url, access_token, refresh_token)
+    except RuntimeError as e:
+        print(str(e))
+        exit(1)
+
+    # 只处理当前仍挂着代理的账号（outbound_proxy_id 非空），已是无代理的跳过
+    targets = [a for a in all_disabled if a.get("outbound_proxy_id")]
+    skipped_noproxy = len(all_disabled) - len(targets)
+
+    print("\n" + "=" * 60)
+    print("已停用账号 → 改为无代理")
+    print("=" * 60)
+    print(f"\n已停用账号数: {len(all_disabled)}"
+          + (f"（API total={total_accounts}）" if total_accounts else ""))
+    print(f"其中仍挂代理、待改为无代理: {len(targets)}；已是无代理跳过: {skipped_noproxy}")
+
+    if not targets:
+        print("\n没有需要处理的账号。")
+        print("=" * 60)
+        return
+
+    print(f"\n--- 待处理账号 ({len(targets)}) ---")
+    for acc in targets:
+        name = acc.get("name") or acc.get("email") or acc.get("id", "?")
+        print(f"  {name}  proxy={acc.get('outbound_proxy_id')}")
+
+    if dry_run:
+        print("\n[dry-run] 仅预览，未发起任何修改。去掉 --dry-run 执行。")
+        print("=" * 60)
+        return
+
+    if not assume_yes and sys.stdin.isatty():
+        try:
+            ans = input(f"\n确认把以上 {len(targets)} 个账号改为无代理？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "yes"):
+            print("已取消。")
+            return
+
+    ok, failed = 0, []
+    for i, acc in enumerate(targets, 1):
+        acc_id = acc.get("id")
+        name = acc.get("name") or acc.get("email") or acc_id or "?"
+        if not acc_id:
+            failed.append((name, "缺少 id"))
+            continue
+        # 保留账号现有限流配置，仅把出站代理置空；缺失字段回退到后台默认值
+        payload = {
+            "max_rpm": acc.get("max_rpm", 100),
+            "max_tpm": acc.get("max_tpm", 8000000),
+            "max_concurrent": acc.get("max_concurrent", 20),
+            "max_sessions": acc.get("max_sessions", 100),
+            "outbound_proxy_id": None,
+        }
+        try:
+            _oauth_admin_write(base_url, f"/api/admin/oauth-accounts/{acc_id}",
+                               access_token, payload, refresh_token, "PATCH")
+            ok += 1
+            logger.info(f"[{i}/{len(targets)}] {name} 已改为无代理")
+        except RuntimeError as e:
+            failed.append((name, str(e)))
+            logger.warning(f"[{i}/{len(targets)}] {name} 改无代理失败: {e}")
+
+    print("\n" + "=" * 60)
+    print(f"完成：成功 {ok}/{len(targets)}，失败 {len(failed)}")
+    if failed:
+        for name, reason in failed:
+            print(f"  失败 {name}: {reason}")
     print("=" * 60)
     return
