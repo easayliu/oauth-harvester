@@ -1059,6 +1059,8 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
 
             # 7. 等待登录完成 + 自动推进注册引导
             last_url = ""
+            unrecognized_streak = 0
+            manual_warned = False
             for i in range(120):
                 await page.wait_for_timeout(3000)
                 current_url = page.url
@@ -1072,10 +1074,12 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
 
                 try:
                     action = await _claude_advance_onboarding(page, email_addr)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"onboarding 推进异常: {e}")
                     action = ""
                 if action:
                     logger.info(f"自动通过注册引导: {action}")
+                    unrecognized_streak = 0
                     continue
 
                 terms_btn = page.locator(
@@ -1085,7 +1089,31 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 if await terms_btn.count() > 0 and await terms_btn.first.is_visible():
                     await terms_btn.first.click()
                     await human_delay(page, "click")
+                    unrecognized_streak = 0
                     continue
+
+                # 仍停留在 signup/onboarding 但识别不出来 → 截图+日志（便于排查）
+                if "signup" in current_url or "register" in current_url or "onboarding" in current_url:
+                    unrecognized_streak += 1
+                    if unrecognized_streak == 3 and not manual_warned:
+                        logger.warning(
+                            f"⚠️  未识别的注册/引导页面 URL={current_url}，已截图 "
+                            f"claude_needs_manual_*，继续等待（共 {(i+1)*3}s）"
+                        )
+                        await page.screenshot(
+                            path=_screenshot_path("claude_needs_manual", email_addr))
+                        try:
+                            btn_texts = await page.locator("button").all_inner_texts()
+                            visible_btns = [t.strip() for t in btn_texts if t.strip()]
+                            logger.warning(f"   当前页面按钮文案: {visible_btns}")
+                        except Exception as e:
+                            logger.debug(f"收集按钮文案失败: {e}")
+                        manual_warned = True
+                    # 每 30s 再补一张，观察页面是否有变化
+                    elif unrecognized_streak % 10 == 0:
+                        await page.screenshot(
+                            path=_screenshot_path(
+                                f"claude_needs_manual_{unrecognized_streak*3}s", email_addr))
 
             # 8. 提取 sessionKey（并按需加入后台）
             await _claude_extract_session_and_bind(
