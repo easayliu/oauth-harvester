@@ -862,8 +862,11 @@ async def _claude_profile_logged_in(page, context) -> bool:
 
 
 async def _claude_extract_session_and_bind(page, context, email_addr, app_password,
-                                           bind_after, admin_token, screenshot_path):
-    """提取 sessionKey（写入 session.txt），需要时再执行加入后台。已登录/新登录两条路径共用。"""
+                                           bind_after, admin_token, screenshot_path) -> bool:
+    """提取 sessionKey（写入 session.txt），需要时再执行加入后台。已登录/新登录两条路径共用。
+
+    返回该账号是否「整体成功」：claude-email 以拿到 sessionKey 为准；
+    claude-bind 还需后台绑定（exchange 落库）成功。供批量统计与末尾汇总失败账号。"""
     logger.info(f"最终页面: {page.url}")
     try:
         await page.screenshot(path=screenshot_path("email_final", email_addr))
@@ -889,11 +892,13 @@ async def _claude_extract_session_and_bind(page, context, email_addr, app_passwo
     if bind_after:
         if session_key:
             logger.info("开始把账号加入 oauth-accounts 后台...")
-            await _bind_account_to_backend(page, email_addr, screenshot_path, admin_token)
+            bound = await _bind_account_to_backend(page, email_addr, screenshot_path, admin_token)
+            return bool(bound)
         else:
             logger.warning("未登录成功（无 sessionKey），跳过加入后台")
             print("\n[bind] 未登录成功，跳过加入后台。\n")
-    return session_key
+            return False
+    return bool(session_key)
 
 
 async def run_claude_email(mode: str, raw_input: str, is_file: bool):
@@ -933,17 +938,46 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
         total = len(accounts)
         logger.info(f"批量模式：共 {total} 个账号")
         ok = 0
+        failed = []  # [(email, 原因)]：登录/绑定未成功或超时/异常的账号，末尾统一输出
+        # 单账号总时长封顶：内部各步已各自带超时（IMAP 300s、引导轮询 360s 等），
+        # 这里再加一道硬上限，防止个别步骤卡住拖死整批。可用 --per-account-timeout=秒 覆盖。
+        per_acct_timeout = next(
+            (int(a.split("=", 1)[1]) for a in sys.argv[3:]
+             if a.startswith("--per-account-timeout=")), 900)
         for idx, (imap_host, imap_port, email_addr, app_password) in enumerate(accounts, 1):
             logger.info(f"========== [{idx}/{total}] {email_addr} ==========")
             try:
-                await _run_claude_email_single(
-                    imap_host, imap_port, email_addr, app_password,
-                    delete_after=delete_after, bind_after=bind_after,
-                    admin_token=admin_token, overrides=overrides, interactive=False)
-                ok += 1
+                done = await asyncio.wait_for(
+                    _run_claude_email_single(
+                        imap_host, imap_port, email_addr, app_password,
+                        delete_after=delete_after, bind_after=bind_after,
+                        admin_token=admin_token, overrides=overrides, interactive=False),
+                    timeout=per_acct_timeout)
+                if done:
+                    ok += 1
+                else:
+                    reason = "未成功绑定" if bind_after else "未登录成功"
+                    logger.warning(f"[{idx}/{total}] {email_addr} {reason}，跳过")
+                    failed.append((email_addr, reason))
+            except asyncio.TimeoutError:
+                logger.error(f"[{idx}/{total}] {email_addr} 超过单账号时限 {per_acct_timeout}s，跳过")
+                failed.append((email_addr, f"超时(>{per_acct_timeout}s)"))
             except Exception as e:
                 logger.error(f"[{idx}/{total}] {email_addr} 处理失败: {e}")
-        logger.info(f"批量完成：成功 {ok}/{total}（失败 {total - ok}）")
+                failed.append((email_addr, f"异常: {e}"))
+        logger.info(f"批量完成：成功 {ok}/{total}（失败 {len(failed)}）")
+        if failed:
+            lines = "\n".join(f"  {e}\t{r}" for e, r in failed)
+            mode_label = "未成功绑定" if bind_after else "未登录成功"
+            logger.warning(f"以下 {len(failed)} 个账号{mode_label}/失败：\n{lines}")
+            try:
+                out_name = "bind_failed.txt" if bind_after else "login_failed.txt"
+                with open(out_name, "w") as f:
+                    for e, r in failed:
+                        f.write(f"{e}----{r}\n")
+                logger.info(f"失败账号已写入 {out_name}")
+            except Exception as e:
+                logger.debug(f"写失败账号文件出错: {e}")
         return
 
     # 单条
@@ -997,6 +1031,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
         os_name=overrides.get("os_name"),
         geoip=overrides.get("geoip"),
     )
+    success = False  # 该账号是否整体成功（含 bind）；供批量统计与末尾汇总失败账号
     try:
         try:
             page = context.pages[0] if context.pages else await context.new_page()
@@ -1006,7 +1041,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
             logger.info("检测该 profile 是否已登录 Claude...")
             if await _claude_profile_logged_in(page, context):
                 logger.info("该 profile 已登录 Claude，跳过邮箱登录流程")
-                await _claude_extract_session_and_bind(
+                success = await _claude_extract_session_and_bind(
                     page, context, email_addr, app_password,
                     bind_after, admin_token, _screenshot_path)
                 if interactive and sys.stdin.isatty():
@@ -1014,11 +1049,18 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                         input("流程结束，按回车键关闭浏览器...")
                     except (EOFError, KeyboardInterrupt):
                         pass
-                return
+                return success
 
             # 1. 打开 Claude 登录页
+            #    claude.ai 是重前端 SPA，叠加代理时 domcontentloaded 常要十几二十秒、
+            #    易超默认 30s 超时。只需导航 commit（服务器响应一到）即可，后面本就
+            #    轮询等待邮箱输入框出现，故用 wait_until="commit" 提速并抬高超时。
             logger.info("正在打开 claude.ai/login...")
-            await page.goto("https://claude.ai/login", wait_until="domcontentloaded")
+            try:
+                await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
+            except Exception as e:
+                logger.warning(f"打开 claude.ai/login 超时/失败，重试一次: {e}")
+                await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
             await human_delay(page, "navigate")
             await page.screenshot(path=_screenshot_path("email_landing", email_addr))
 
@@ -1042,7 +1084,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 await page.screenshot(path=_screenshot_path("email_no_input", email_addr))
                 if interactive and sys.stdin.isatty():
                     input("未找到邮箱输入框，按回车键关闭浏览器...")
-                return
+                return False
 
             # 3. 点击 "Continue with email"（严格匹配，避免误点 Google/Apple）
             submit_btn = page.locator(
@@ -1077,11 +1119,16 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 await page.screenshot(path=_screenshot_path("email_no_link", email_addr))
                 if interactive and sys.stdin.isatty():
                     input("未抓到登录链接，按回车键关闭浏览器...")
-                return
+                return False
 
             # 6. 在原页面打开 magic link（同一 context，cookie 共享）
+            #    同样用 commit + 抬高超时，避免重前端/代理下 domcontentloaded 卡满默认 30s。
             logger.info(f"抓到登录链接，在原页面打开...")
-            await page.goto(magic_link, wait_until="domcontentloaded")
+            try:
+                await page.goto(magic_link, wait_until="commit", timeout=45000)
+            except Exception as e:
+                logger.warning(f"打开 magic link 超时/失败，重试一次: {e}")
+                await page.goto(magic_link, wait_until="commit", timeout=45000)
             await human_delay(page, "navigate")
             await page.screenshot(path=_screenshot_path("email_magic_link", email_addr))
 
@@ -1144,7 +1191,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                                 f"claude_needs_manual_{unrecognized_streak*3}s", email_addr))
 
             # 8. 提取 sessionKey（并按需加入后台）
-            await _claude_extract_session_and_bind(
+            success = await _claude_extract_session_and_bind(
                 page, context, email_addr, app_password,
                 bind_after, admin_token, _screenshot_path)
 
@@ -1163,3 +1210,4 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 pass
     finally:
         await close_camoufox_persistent_context(cm)
+    return success
