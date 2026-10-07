@@ -445,11 +445,14 @@ except ImportError:
 try:
     from config import OAUTH_BIND_GROUP_IDS
 except ImportError:
-    OAUTH_BIND_GROUP_IDS = ["fb637398-f209-41a5-8e64-bdbe569ac391"]
+    # 留空：config 未配时交给 claude-bind 用 token 自动查后台（见下方 NAMES 说明）。
+    # 不要在这里写死 id——换后端/vendor 后旧 id 会导致 "not granted to this vendor"。
+    OAUTH_BIND_GROUP_IDS = []
 try:
     from config import OAUTH_BIND_POLICY_TEMPLATE_ID
 except ImportError:
-    OAUTH_BIND_POLICY_TEMPLATE_ID = "ae11cd2c-7df1-4355-b166-2db1afc21095"
+    # 同上，留空触发自动查；写死旧 id 会 exchange 400 not granted。
+    OAUTH_BIND_POLICY_TEMPLATE_ID = ""
 # 不想填 id 时，可留空上面的 id 让 claude-bind 用 token 自动查：
 #   - 填名称 → 按名称解析成 id
 #   - 名称也留空且后台只有一个 → 自动选它；有多个则报错列出让你选

@@ -837,9 +837,13 @@ async def _bind_account_to_backend(page, email_addr: str, screenshot_path,
 
 async def _claude_profile_logged_in(page, context) -> bool:
     """判断当前 profile 是否已登录 claude.ai：打开 /new，被弹回 /login 即未登录；
-    停在 /new|/chat 且有 sessionKey cookie 即已登录。"""
+    停在 /new|/chat 且有 sessionKey cookie 即已登录。
+
+    只需「最终 URL + sessionKey cookie」两个信号，二者在导航 commit（服务器响应一到）
+    时就已确定，不必等整页 DOM/资源加载完——claude.ai 是重前端 SPA，叠加代理时
+    domcontentloaded 常要十几二十秒。故用 wait_until="commit" 提速。"""
     try:
-        await page.goto("https://claude.ai/new", wait_until="domcontentloaded")
+        await page.goto("https://claude.ai/new", wait_until="commit", timeout=20000)
     except Exception:
         return False
     for _ in range(8):
@@ -853,7 +857,7 @@ async def _claude_profile_logged_in(page, context) -> bool:
         has_key = any(c.get("name") == "sessionKey" and c.get("value") for c in cookies)
         if has_key and ("claude.ai/new" in cur or "claude.ai/chat" in cur):
             return True
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(1000)
     return False
 
 

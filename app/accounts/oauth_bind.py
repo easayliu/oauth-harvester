@@ -246,16 +246,37 @@ def _get_auth_url_default(base_url: str = None, token: str = None, refresh_token
     return auth_url, pending_state
 
 
-def _list_items(base_url: str, path: str, token: str, refresh_token: str) -> list:
-    """GET 一个 {items:[{id,name}...]} 列表接口，返回 [(id, name), ...]。"""
+# 列表项里表示「已授权给当前 vendor」的布尔字段名（不同后端命名不一，能命中就按它过滤）
+_GRANTED_FLAGS = ("granted", "is_granted", "isGranted", "vendor_granted",
+                  "vendorGranted", "allowed", "is_allowed")
+
+
+def _list_raw(base_url: str, path: str, token: str, refresh_token: str) -> list:
+    """GET 一个 {items:[...]} 或 [...] 列表接口，返回原始 dict 列表。"""
     data, raw = _request(base_url, path, token, refresh_token, method="GET")
     items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
-    out = []
-    for it in (items or []):
-        if isinstance(it, dict) and it.get("id") is not None:
-            name = it.get("name") or it.get("title") or it.get("label") or ""
-            out.append((str(it["id"]), str(name)))
-    return out
+    return [it for it in (items or []) if isinstance(it, dict)]
+
+
+def _to_id_name(it: dict) -> tuple:
+    name = it.get("name") or it.get("title") or it.get("label") or ""
+    return str(it["id"]), str(name)
+
+
+def _granted_only(items: list) -> list:
+    """若列表项带「已授权」布尔字段，仅保留为真的；都不带该字段则原样返回。
+    过滤后为空时退回原列表，避免把能用的也误删。"""
+    flagged = [it for it in items if any(f in it for f in _GRANTED_FLAGS)]
+    if not flagged:
+        return items
+    kept = [it for it in items if any(it.get(f) for f in _GRANTED_FLAGS)]
+    return kept or items
+
+
+def _list_items(base_url: str, path: str, token: str, refresh_token: str) -> list:
+    """GET 一个 {items:[{id,name}...]} 列表接口，返回 [(id, name), ...]。"""
+    return [_to_id_name(it) for it in _list_raw(base_url, path, token, refresh_token)
+            if it.get("id") is not None]
 
 
 def list_groups(base_url: str = None, token: str = None, refresh_token: str = None) -> list:
@@ -267,11 +288,13 @@ def list_groups(base_url: str = None, token: str = None, refresh_token: str = No
 
 
 def list_policy_templates(base_url: str = None, token: str = None, refresh_token: str = None) -> list:
-    """列出后台策略模板（vendor 可读的 account-policy-templates），返回 [(id, name), ...]。"""
+    """列出后台策略模板（vendor 可读的 account-policy-templates），返回 [(id, name), ...]。
+    若接口返回里带「已授权」标记，只保留授权给当前 vendor 的，避免挑到没授权的模板。"""
     base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
     token = token if token is not None else OAUTH_ADMIN_API_TOKEN
     refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
-    return _list_items(base_url, ACCOUNT_POLICY_TEMPLATES_PATH, token, refresh_token)
+    raw = _granted_only(_list_raw(base_url, ACCOUNT_POLICY_TEMPLATES_PATH, token, refresh_token))
+    return [_to_id_name(it) for it in raw if it.get("id") is not None]
 
 
 def _pick_ids(items: list, wanted_names, kind: str) -> list:
@@ -321,6 +344,7 @@ def _exchange_default(code: str, pending_state: str, base_url: str = None,
     refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
     group_ids, policy_template_id = resolve_bind_targets(
         token, refresh_token, group_ids, policy_template_id)
+    logger.info(f"exchange 使用 group_ids={group_ids} policy_template_id={policy_template_id}")
     payload = {
         "code": code,
         "pending_state": pending_state,
@@ -334,5 +358,22 @@ def _exchange_default(code: str, pending_state: str, base_url: str = None,
         "group_ids": group_ids,
         "policy_template_id": policy_template_id,
     }
-    data, raw = _request(base_url, EXCHANGE_PATH, token, refresh_token, method="POST", body=payload)
+    try:
+        data, raw = _request(base_url, EXCHANGE_PATH, token, refresh_token, method="POST", body=payload)
+    except RuntimeError as e:
+        # 配的 / 默认的 policy_template_id 没授权给当前 vendor（常见于换后端后旧 id 失效）：
+        # 忽略它，从后台「已授权」模板里重新挑一个重试一次。
+        if "policy_template_id is not granted" not in str(e):
+            raise
+        logger.warning(f"策略模板 {policy_template_id} 未授权给当前 vendor，改从后台可用模板自动挑选重试...")
+        avail = list_policy_templates(token=token, refresh_token=refresh_token)
+        retry_tpl = _pick_ids(avail, OAUTH_BIND_POLICY_TEMPLATE_NAME, "策略模板")[0]
+        if retry_tpl == policy_template_id:
+            raise RuntimeError(
+                f"{e}；且后台可用模板里仍只挑到同一个 {retry_tpl}，"
+                f"请在后台确认当前 vendor 已被授予可用策略模板，或在 config 的 "
+                f"OAUTH_BIND_POLICY_TEMPLATE_NAME 指定授权的模板名")
+        logger.info(f"改用策略模板 {retry_tpl} 重试 exchange")
+        payload["policy_template_id"] = retry_tpl
+        data, raw = _request(base_url, EXCHANGE_PATH, token, refresh_token, method="POST", body=payload)
     return data if isinstance(data, dict) else {"raw": raw}
