@@ -28,6 +28,8 @@ from app.settings import (
     OAUTH_BIND_OUTBOUND_PROXY_ID,
     OAUTH_BIND_OUTBOUND_PROXY_MODE,
     OAUTH_BIND_POLICY_TEMPLATE_ID,
+    OAUTH_BIND_GROUP_NAMES,
+    OAUTH_BIND_POLICY_TEMPLATE_NAME,
     LUBAN_ADMIN_PASSWORD,
     LUBAN_BASE_URL,
     LUBAN_BIND_LABEL,
@@ -38,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 AUTH_URL_PATH = "/api/admin/oauth-accounts/auth-url"
 EXCHANGE_PATH = "/api/admin/oauth-accounts/exchange"
+# 分组 / 策略模板列表（vendor 可读；注意模板用 account-policy-templates，/policy-templates 是 admin 专属）
+GROUPS_PATH = "/api/admin/groups"
+ACCOUNT_POLICY_TEMPLATES_PATH = "/api/admin/account-policy-templates"
 
 # luban 后端的接口路径（鉴权为 Authorization: Bearer <管理员密码>）
 LUBAN_AUTHORIZE_PATH = "/api/authorize"
@@ -241,13 +246,81 @@ def _get_auth_url_default(base_url: str = None, token: str = None, refresh_token
     return auth_url, pending_state
 
 
-def _exchange_default(code: str, pending_state: str, base_url: str = None,
-                      token: str = None, refresh_token: str = None,
-                      group_ids: list = None, policy_template_id: str = None) -> dict:
-    """POST exchange，用 code + pending_state 换取并落库。返回解析后的 JSON。"""
+def _list_items(base_url: str, path: str, token: str, refresh_token: str) -> list:
+    """GET 一个 {items:[{id,name}...]} 列表接口，返回 [(id, name), ...]。"""
+    data, raw = _request(base_url, path, token, refresh_token, method="GET")
+    items = data.get("items") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    out = []
+    for it in (items or []):
+        if isinstance(it, dict) and it.get("id") is not None:
+            name = it.get("name") or it.get("title") or it.get("label") or ""
+            out.append((str(it["id"]), str(name)))
+    return out
+
+
+def list_groups(base_url: str = None, token: str = None, refresh_token: str = None) -> list:
+    """列出后台分组，返回 [(id, name), ...]。"""
     base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
     token = token if token is not None else OAUTH_ADMIN_API_TOKEN
     refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
+    return _list_items(base_url, GROUPS_PATH, token, refresh_token)
+
+
+def list_policy_templates(base_url: str = None, token: str = None, refresh_token: str = None) -> list:
+    """列出后台策略模板（vendor 可读的 account-policy-templates），返回 [(id, name), ...]。"""
+    base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
+    token = token if token is not None else OAUTH_ADMIN_API_TOKEN
+    refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
+    return _list_items(base_url, ACCOUNT_POLICY_TEMPLATES_PATH, token, refresh_token)
+
+
+def _pick_ids(items: list, wanted_names, kind: str) -> list:
+    """从 [(id,name)] 里按名称挑 id；名称为空时若只有一个就自动选，多个则报错列出。"""
+    names = [n for n in (wanted_names if isinstance(wanted_names, list) else [wanted_names]) if n]
+    if names:
+        by_name = {n: i for i, n in items}
+        missing = [n for n in names if n not in by_name]
+        if missing:
+            avail = "、".join(n for _, n in items) or "(空)"
+            raise RuntimeError(f"{kind}名称未找到: {missing}；后台可选: {avail}")
+        return [by_name[n] for n in names]
+    if len(items) == 1:
+        logger.info(f"自动选择{kind}: {items[0][1]}={items[0][0]}")
+        return [items[0][0]]
+    listing = "；".join(f"{n}={i}" for i, n in items) or "(空)"
+    raise RuntimeError(
+        f"{kind}有 {len(items)} 个，无法自动确定，请在 config 填 id 或名称。可选: {listing}")
+
+
+def resolve_bind_targets(token: str = None, refresh_token: str = None,
+                         group_ids: list = None, policy_template_id: str = None) -> tuple:
+    """补齐 (group_ids, policy_template_id)：显式 id > config id > 按名称查 > 唯一则自动选。
+
+    只在缺失时才请求对应列表接口。
+    """
+    gids = group_ids if group_ids else (list(OAUTH_BIND_GROUP_IDS) if OAUTH_BIND_GROUP_IDS else [])
+    tpl = policy_template_id or OAUTH_BIND_POLICY_TEMPLATE_ID or ""
+    if not gids:
+        gids = _pick_ids(list_groups(token=token, refresh_token=refresh_token),
+                         OAUTH_BIND_GROUP_NAMES, "分组")
+    if not tpl:
+        tpl = _pick_ids(list_policy_templates(token=token, refresh_token=refresh_token),
+                        OAUTH_BIND_POLICY_TEMPLATE_NAME, "策略模板")[0]
+    return gids, tpl
+
+
+def _exchange_default(code: str, pending_state: str, base_url: str = None,
+                      token: str = None, refresh_token: str = None,
+                      group_ids: list = None, policy_template_id: str = None) -> dict:
+    """POST exchange，用 code + pending_state 换取并落库。返回解析后的 JSON。
+
+    group_ids / policy_template_id 未显式传、config 里也空时，用 token 自动查后台 id。
+    """
+    base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
+    token = token if token is not None else OAUTH_ADMIN_API_TOKEN
+    refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
+    group_ids, policy_template_id = resolve_bind_targets(
+        token, refresh_token, group_ids, policy_template_id)
     payload = {
         "code": code,
         "pending_state": pending_state,
@@ -258,8 +331,8 @@ def _exchange_default(code: str, pending_state: str, base_url: str = None,
         "max_tpm": OAUTH_BIND_MAX_TPM,
         "max_concurrent": OAUTH_BIND_MAX_CONCURRENT,
         "max_sessions": OAUTH_BIND_MAX_SESSIONS,
-        "group_ids": group_ids if group_ids is not None else OAUTH_BIND_GROUP_IDS,
-        "policy_template_id": policy_template_id if policy_template_id is not None else OAUTH_BIND_POLICY_TEMPLATE_ID,
+        "group_ids": group_ids,
+        "policy_template_id": policy_template_id,
     }
     data, raw = _request(base_url, EXCHANGE_PATH, token, refresh_token, method="POST", body=payload)
     return data if isinstance(data, dict) else {"raw": raw}

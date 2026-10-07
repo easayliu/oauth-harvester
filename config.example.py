@@ -208,8 +208,12 @@ OAUTH_BIND_MAX_RPM             = 100
 OAUTH_BIND_MAX_TPM             = 8000000
 OAUTH_BIND_MAX_CONCURRENT      = 50
 OAUTH_BIND_MAX_SESSIONS        = 100
-OAUTH_BIND_GROUP_IDS           = ["fb637398-f209-41a5-8e64-bdbe569ac391"]
-OAUTH_BIND_POLICY_TEMPLATE_ID  = "ae11cd2c-7df1-4355-b166-2db1afc21095"
+# group / template：可直接填 id；也可留空（[]/""）让 claude-bind 用 token 自动查：
+#   填 NAMES/NAME → 按名称解析；名称也留空且后台只有一个 → 自动选它，多个则报错列出让你选
+OAUTH_BIND_GROUP_IDS           = []     # 如 ["fb637398-..."]；留空走自动
+OAUTH_BIND_POLICY_TEMPLATE_ID  = ""     # 如 "ae11cd2c-..."；留空走自动
+OAUTH_BIND_GROUP_NAMES         = []     # 如 ["蒸馏1"]；按分组名自动解析 id
+OAUTH_BIND_POLICY_TEMPLATE_NAME = ""    # 如 "蒸馏"；按模板名自动解析 id
 
 # claude-bind 后端类型： "default"=上面的 oauth-accounts 后台； "luban"=luban 服务
 OAUTH_BIND_BACKEND             = "default"

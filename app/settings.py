@@ -450,6 +450,17 @@ try:
     from config import OAUTH_BIND_POLICY_TEMPLATE_ID
 except ImportError:
     OAUTH_BIND_POLICY_TEMPLATE_ID = "ae11cd2c-7df1-4355-b166-2db1afc21095"
+# 不想填 id 时，可留空上面的 id 让 claude-bind 用 token 自动查：
+#   - 填名称 → 按名称解析成 id
+#   - 名称也留空且后台只有一个 → 自动选它；有多个则报错列出让你选
+try:
+    from config import OAUTH_BIND_GROUP_NAMES
+except ImportError:
+    OAUTH_BIND_GROUP_NAMES = []
+try:
+    from config import OAUTH_BIND_POLICY_TEMPLATE_NAME
+except ImportError:
+    OAUTH_BIND_POLICY_TEMPLATE_NAME = ""
 
 # claude-bind 的后端类型：
 #   "default" → oauth-accounts 后台（OAUTH_ADMIN_API_* / OAUTH_BIND_*）
