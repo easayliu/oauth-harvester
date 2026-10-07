@@ -18,6 +18,7 @@ from app.settings import (
     OAUTH_ADMIN_API_BASE_URL,
     OAUTH_ADMIN_API_REFRESH_TOKEN,
     OAUTH_ADMIN_API_TOKEN,
+    OAUTH_BIND_BACKEND,
     OAUTH_BIND_GROUP_IDS,
     OAUTH_BIND_INFERENCE_BACKEND,
     OAUTH_BIND_MAX_CONCURRENT,
@@ -27,12 +28,29 @@ from app.settings import (
     OAUTH_BIND_OUTBOUND_PROXY_ID,
     OAUTH_BIND_OUTBOUND_PROXY_MODE,
     OAUTH_BIND_POLICY_TEMPLATE_ID,
+    LUBAN_ADMIN_PASSWORD,
+    LUBAN_BASE_URL,
+    LUBAN_BIND_LABEL,
+    LUBAN_BIND_PROXY,
 )
 
 logger = logging.getLogger(__name__)
 
 AUTH_URL_PATH = "/api/admin/oauth-accounts/auth-url"
 EXCHANGE_PATH = "/api/admin/oauth-accounts/exchange"
+
+# luban 后端的接口路径（鉴权为 Authorization: Bearer <管理员密码>）
+LUBAN_AUTHORIZE_PATH = "/api/authorize"
+LUBAN_EXCHANGE_PATH = "/api/exchange"
+
+
+def _state_from_url(url: str) -> str:
+    """从授权 URL 的 state 查询参数里取 pending_state。"""
+    try:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        return (qs.get("state") or [""])[0]
+    except Exception:
+        return ""
 
 
 def _refresh_access_token(base_url: str, refresh_token: str) -> str | None:
@@ -120,9 +138,65 @@ def get_access_token(base_url: str = None, token: str = None, refresh_token: str
     raise RuntimeError("未配置 OAUTH_ADMIN_API_TOKEN / OAUTH_ADMIN_API_REFRESH_TOKEN")
 
 
-def get_auth_url(base_url: str = None, token: str = None, refresh_token: str = None,
-                 provider: str = "anthropic", oauth_flow: str = "login",
-                 name: str = None) -> tuple:
+def get_auth_url(*args, backend: str = None, **kwargs) -> tuple:
+    """按后端类型分发：拿授权链接，返回 (auth_url, pending_state)。
+
+    backend 省略时取 config 的 OAUTH_BIND_BACKEND（default / luban）。
+    """
+    backend = backend or OAUTH_BIND_BACKEND
+    if backend == "luban":
+        return _get_auth_url_luban()
+    return _get_auth_url_default(*args, **kwargs)
+
+
+def exchange(code: str, pending_state: str, *args, backend: str = None, **kwargs) -> dict:
+    """按后端类型分发：用 code 换取并落库，返回解析后的 JSON。"""
+    backend = backend or OAUTH_BIND_BACKEND
+    if backend == "luban":
+        return _exchange_luban(code)
+    return _exchange_default(code, pending_state, *args, **kwargs)
+
+
+# ---------- luban 后端：GET /api/authorize + POST /api/exchange，Bearer <管理员密码> ----------
+
+def _get_auth_url_luban() -> tuple:
+    """luban：GET /api/authorize（Bearer 管理员密码）→ {url}；pending_state 从 url 的 state 取。"""
+    if not LUBAN_ADMIN_PASSWORD:
+        raise RuntimeError("未配置 LUBAN_ADMIN_PASSWORD（luban 网页『接入设置』里设的管理员密码）")
+    base_url = LUBAN_BASE_URL.rstrip("/")
+    data, raw = _request(base_url, LUBAN_AUTHORIZE_PATH, LUBAN_ADMIN_PASSWORD, "", method="GET")
+    auth_url = data.get("url") if isinstance(data, dict) else None
+    if not auth_url:
+        raise RuntimeError(f"luban authorize 响应缺少 url: {raw[:500]}")
+    pending_state = _state_from_url(auth_url)
+    if not pending_state:
+        raise RuntimeError(f"luban authorize 的 url 里没有 state 参数: {auth_url[:300]}")
+    return auth_url, pending_state
+
+
+def _exchange_luban(code: str) -> dict:
+    """luban：POST /api/exchange（Bearer 管理员密码），body {code, label?, proxy?}。
+
+    luban 的 exchange 从 code 自己解析 state，不需要单独传 pending_state；
+    group/template/限额由 luban 用 /credentials 单独管理，此处不带。
+    """
+    if not LUBAN_ADMIN_PASSWORD:
+        raise RuntimeError("未配置 LUBAN_ADMIN_PASSWORD")
+    base_url = LUBAN_BASE_URL.rstrip("/")
+    payload = {"code": code}
+    if LUBAN_BIND_LABEL:
+        payload["label"] = LUBAN_BIND_LABEL
+    if LUBAN_BIND_PROXY:
+        payload["proxy"] = LUBAN_BIND_PROXY
+    data, raw = _request(base_url, LUBAN_EXCHANGE_PATH, LUBAN_ADMIN_PASSWORD, "", method="POST", body=payload)
+    return data if isinstance(data, dict) else {"raw": raw}
+
+
+# ---------- default 后端：oauth-accounts 后台（POST auth-url + POST exchange） ----------
+
+def _get_auth_url_default(base_url: str = None, token: str = None, refresh_token: str = None,
+                          provider: str = "anthropic", oauth_flow: str = "login",
+                          name: str = None) -> tuple:
     """POST auth-url，返回 (auth_url, pending_state)。
 
     请求体与后台前端一致（vendor 账号必须走 POST，GET 会 403 Not available for vendor accounts）：
@@ -167,9 +241,9 @@ def get_auth_url(base_url: str = None, token: str = None, refresh_token: str = N
     return auth_url, pending_state
 
 
-def exchange(code: str, pending_state: str, base_url: str = None,
-             token: str = None, refresh_token: str = None,
-             group_ids: list = None, policy_template_id: str = None) -> dict:
+def _exchange_default(code: str, pending_state: str, base_url: str = None,
+                      token: str = None, refresh_token: str = None,
+                      group_ids: list = None, policy_template_id: str = None) -> dict:
     """POST exchange，用 code + pending_state 换取并落库。返回解析后的 JSON。"""
     base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
     token = token if token is not None else OAUTH_ADMIN_API_TOKEN

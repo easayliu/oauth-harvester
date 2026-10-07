@@ -450,3 +450,28 @@ try:
     from config import OAUTH_BIND_POLICY_TEMPLATE_ID
 except ImportError:
     OAUTH_BIND_POLICY_TEMPLATE_ID = "ae11cd2c-7df1-4355-b166-2db1afc21095"
+
+# claude-bind 的后端类型：
+#   "default" → oauth-accounts 后台（OAUTH_ADMIN_API_* / OAUTH_BIND_*）
+#   "luban"   → luban 服务（LUBAN_BASE_URL + LUBAN_ADMIN_PASSWORD，走 /api/authorize + /api/exchange）
+try:
+    from config import OAUTH_BIND_BACKEND
+except ImportError:
+    OAUTH_BIND_BACKEND = "default"
+try:
+    from config import LUBAN_BASE_URL
+except ImportError:
+    LUBAN_BASE_URL = "http://127.0.0.1:4600"
+try:
+    from config import LUBAN_ADMIN_PASSWORD
+except ImportError:
+    LUBAN_ADMIN_PASSWORD = ""
+# exchange 时可选带的显示名 / 出站代理（留空则 luban 自动命名 / 直连）
+try:
+    from config import LUBAN_BIND_LABEL
+except ImportError:
+    LUBAN_BIND_LABEL = None
+try:
+    from config import LUBAN_BIND_PROXY
+except ImportError:
+    LUBAN_BIND_PROXY = None

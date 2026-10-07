@@ -211,6 +211,14 @@ OAUTH_BIND_MAX_SESSIONS        = 100
 OAUTH_BIND_GROUP_IDS           = ["fb637398-f209-41a5-8e64-bdbe569ac391"]
 OAUTH_BIND_POLICY_TEMPLATE_ID  = "ae11cd2c-7df1-4355-b166-2db1afc21095"
 
+# claude-bind 后端类型： "default"=上面的 oauth-accounts 后台； "luban"=luban 服务
+OAUTH_BIND_BACKEND             = "default"
+# luban 后端（OAUTH_BIND_BACKEND="luban" 时生效）；走 /api/authorize + /api/exchange
+LUBAN_BASE_URL                 = "http://127.0.0.1:4600"   # luban 地址（默认端口 4600）
+LUBAN_ADMIN_PASSWORD           = ""      # luban 网页「接入设置」里设的管理员密码（作 Bearer）
+LUBAN_BIND_LABEL               = None    # exchange 可选显示名；留空由 luban 自动命名
+LUBAN_BIND_PROXY               = None    # exchange 可选出站代理；留空直连
+
 # ═══════════════════════════════════════════════════════════════════
 # MXroute 邮箱 API（python main.py email）
 # ═══════════════════════════════════════════════════════════════════

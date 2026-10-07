@@ -794,16 +794,19 @@ async def _bind_account_to_backend(page, email_addr: str, screenshot_path,
         return False
 
     logger.info(f"exchange 成功: {result}")
+    data = result.get("data") if isinstance(result.get("data"), dict) else result
     print("\n" + "=" * 60)
     print(f"[bind] 账号已加入后台: {email_addr}")
-    name = (result.get("name") or result.get("email")
-            or (result.get("data") or {}).get("name")
-            or (result.get("data") or {}).get("email") or "")
-    acc_id = (result.get("id") or (result.get("data") or {}).get("id") or "")
+    # 兼容两种后端：default 多为 name/email；luban 为 label/tier
+    name = (data.get("name") or data.get("email") or data.get("label") or "")
+    acc_id = data.get("id", "")
+    tier = data.get("tier") or ""
     if name:
         print(f"       name={name}")
-    if acc_id:
+    if acc_id != "":
         print(f"       id={acc_id}")
+    if tier:
+        print(f"       tier={tier}")
     print("=" * 60 + "\n")
     return True
 
