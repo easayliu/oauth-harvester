@@ -64,12 +64,20 @@ def print_help():
 
   claude-email    Camoufox 自动化登录 Claude（自动填邮箱、抓链接、推引导、提取 sessionKey）
                   python main.py claude-email 'email----app_password'
+                  批量：传文件路径即逐个处理 → python main.py claude-email accounts.txt
 
   claude-bind     同 claude-email，登录成功后再自动走 OAuth 授权，把账号加入 oauth-accounts 后台
                   python main.py claude-bind 'email----app_password'
-                  （或 python main.py claude-email 'email----app_password' --bind）
+                  批量：python main.py claude-bind accounts.txt
+                  （或 python main.py claude-email ... --bind）
                   后台地址/鉴权复用 OAUTH_ADMIN_API_*，exchange 入参见 OAUTH_BIND_*（config.py）
-                  需管理员账号 token（vendor 账号会被 403）；可临时用 --admin-token=<access_token> 覆盖
+                  可临时用 --admin-token=<access_token> 覆盖后台 token
+                  批量文件两种布局：
+                    A) 首行 IMAP 服务器，其后每行 email:password（同邮箱域共享服务器，推荐）
+                         glacier.mxrouting.net:993
+                         a@gonaoa.com:pwd1
+                         b@gonaoa.com:pwd2
+                    B) 每行一个 email----app_password（按域名推断服务器）
 
   chatgpt-mail    同 claude-mail，打开 ChatGPT 登录页，抓验证码 → 剪贴板
                   python main.py chatgpt-mail 'email----app_password'

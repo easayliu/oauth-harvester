@@ -161,6 +161,56 @@ def _parse_mail_account(raw: str):
     return host, port, email_addr, password
 
 
+def _parse_mail_account_file(path: str) -> list:
+    """解析批量账号文件，返回 [(host, port, email, password), ...]。支持两种布局：
+
+    A) 共享 IMAP 服务器（首行是服务器行，其后每行一个凭据）：
+         glacier.mxrouting.net:993
+         a@gonaoa.com:pwd1
+         b@gonaoa.com:pwd2
+       （凭据行 email:password 或 email----password 均可）
+
+    B) 每行一个完整账号（按域名推断服务器）：
+         jessica@yahoo.com----appswd
+         bob@nifty.com----pwd
+
+    以 # 开头的行和空行忽略。无法解析的行跳过并告警。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw_lines = f.readlines()
+    except Exception as e:
+        logger.error(f"读取账号文件失败: {e}")
+        return []
+
+    lines = [ln.strip() for ln in raw_lines if ln.strip() and not ln.strip().startswith("#")]
+    if not lines:
+        return []
+
+    # 判定首行是否为「共享 IMAP 服务器行」：不含 @ 且形如 host[:port]
+    first = lines[0]
+    shared_host_line = ""
+    if "@" not in first and ("." in first.split(":", 1)[0]):
+        shared_host_line = first
+        cred_lines = lines[1:]
+    else:
+        cred_lines = lines
+
+    accounts = []
+    for cred in cred_lines:
+        if "@" not in cred:
+            continue
+        # 共享服务器时，把「服务器行 + 凭据行」拼成两行块复用 _parse_mail_account；
+        # 否则单行交给域名推断。
+        block = f"{shared_host_line}\n{cred}" if shared_host_line else cred
+        parsed = _parse_mail_account(block)
+        if parsed:
+            accounts.append(parsed)
+        else:
+            logger.warning(f"跳过无法解析的账号行: {cred}")
+    return accounts
+
+
 async def run_chrome(mode: str, raw_input: str, is_file: bool):
     if is_file:
         print("chrome 模式只接受单个 email/profile 名，不支持文件")
@@ -821,9 +871,13 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
     流程：Camoufox 打开 claude.ai/login → 自动填邮箱并提交 → 后台 IMAP 抓 magic link
     → 同一 context 内导航到 magic link → 自动推进注册引导 → 提取 sessionKey。
 
-    输入格式同 claude-mail：
+    单条输入格式同 claude-mail：
       1) 两行: host[:port] 换行 email:password
       2) 单行: email----app_password（按域名推断服务器）
+
+    批量：传入文件路径即批量处理（claude-email / claude-bind 均支持）。文件两种布局：
+      A) 首行 IMAP 服务器，其后每行 email:password（共享服务器，推荐同邮箱域批量）
+      B) 每行一个 email----app_password（按域名推断服务器）
 
     claude-bind 模式（或 claude-email 加 --bind）：登录成功后，自动拉授权链接、
     在同一浏览器完成 OAuth 授权，并调用后台 exchange 把账号加入 oauth-accounts。
@@ -832,10 +886,36 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
     bind_after = mode == "claude-bind" or "--bind" in sys.argv[3:]
     admin_token = next((a.split("=", 1)[1] for a in sys.argv[3:]
                         if a.startswith("--admin-token=")), None)
-    if is_file:
-        print(f"{mode} 模式只接受单条账号，不支持文件")
-        exit(1)
+    overrides = _parse_browser_cli_overrides()
 
+    # 批量：文件输入
+    if is_file:
+        accounts = _parse_mail_account_file(raw_input)
+        if not accounts:
+            print("文件中未解析到有效账号。支持两种文件格式：")
+            print("  A) 首行 IMAP 服务器，其后每行 email:password（或 email----password）：")
+            print("       glacier.mxrouting.net:993")
+            print("       a@gonaoa.com:pwd1")
+            print("       b@gonaoa.com:pwd2")
+            print("  B) 每行一个 email----app_password（按域名推断服务器）")
+            exit(1)
+        total = len(accounts)
+        logger.info(f"批量模式：共 {total} 个账号")
+        ok = 0
+        for idx, (imap_host, imap_port, email_addr, app_password) in enumerate(accounts, 1):
+            logger.info(f"========== [{idx}/{total}] {email_addr} ==========")
+            try:
+                await _run_claude_email_single(
+                    imap_host, imap_port, email_addr, app_password,
+                    delete_after=delete_after, bind_after=bind_after,
+                    admin_token=admin_token, overrides=overrides, interactive=False)
+                ok += 1
+            except Exception as e:
+                logger.error(f"[{idx}/{total}] {email_addr} 处理失败: {e}")
+        logger.info(f"批量完成：成功 {ok}/{total}（失败 {total - ok}）")
+        return
+
+    # 单条
     parsed = _parse_mail_account(raw_input)
     if not parsed:
         print("账号格式错误。支持两种格式：")
@@ -843,13 +923,25 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
         print("       imap.nifty.com:993")
         print("       zwt03656@nifty.com:N3ni12491249")
         print("  2) 单行: email----app_password（按域名推断服务器）")
+        print("  （批量：直接传文件路径，见 claude-email --help）")
         exit(1)
-
     imap_host, imap_port, email_addr, app_password = parsed
+    await _run_claude_email_single(
+        imap_host, imap_port, email_addr, app_password,
+        delete_after=delete_after, bind_after=bind_after,
+        admin_token=admin_token, overrides=overrides, interactive=True)
+
+
+async def _run_claude_email_single(imap_host, imap_port, email_addr, app_password, *,
+                                   delete_after, bind_after, admin_token, overrides,
+                                   interactive=True):
+    """对单个账号执行 claude-email / claude-bind 全流程。
+
+    interactive=False（批量时）：账号间不暂停等回车，出错由上层捕获后继续下一个。
+    """
     if "yahoo" in imap_host.lower():
         app_password = app_password.replace(" ", "")
 
-    overrides = _parse_browser_cli_overrides()
     logger.info(f"IMAP 收件服务器: {imap_host}:{imap_port}（{email_addr}）")
 
     from app.core.browser import (
@@ -886,7 +978,7 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
                 await _claude_extract_session_and_bind(
                     page, context, email_addr, app_password,
                     bind_after, admin_token, _screenshot_path)
-                if sys.stdin.isatty():
+                if interactive and sys.stdin.isatty():
                     try:
                         input("流程结束，按回车键关闭浏览器...")
                     except (EOFError, KeyboardInterrupt):
@@ -917,7 +1009,7 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
             else:
                 logger.error("未找到邮箱输入框")
                 await page.screenshot(path=_screenshot_path("email_no_input", email_addr))
-                if sys.stdin.isatty():
+                if interactive and sys.stdin.isatty():
                     input("未找到邮箱输入框，按回车键关闭浏览器...")
                 return
 
@@ -952,7 +1044,7 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
             if not magic_link:
                 logger.warning("未抓到登录链接")
                 await page.screenshot(path=_screenshot_path("email_no_link", email_addr))
-                if sys.stdin.isatty():
+                if interactive and sys.stdin.isatty():
                     input("未抓到登录链接，按回车键关闭浏览器...")
                 return
 
@@ -1005,7 +1097,7 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
             except Exception:
                 pass
 
-        if sys.stdin.isatty():
+        if interactive and sys.stdin.isatty():
             try:
                 input("流程结束，按回车键关闭浏览器...")
             except (EOFError, KeyboardInterrupt):
