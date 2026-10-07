@@ -1,0 +1,191 @@
+"""claude-bind：把一个已登录的 Claude 账号通过 OAuth 授权加到 oauth-accounts 后台。
+
+两步：
+  1. GET  /api/admin/oauth-accounts/auth-url  —— 拿到授权链接 auth_url + pending_state
+  2. 在已登录 Claude 的浏览器里打开 auth_url，点「Authorize」后回跳 callback 带回 code
+  3. POST /api/admin/oauth-accounts/exchange  —— 用 code + pending_state 换取并落库
+
+鉴权方式与 disabled 模式完全一致：优先 access_token，401 时用 refresh_token 刷新后重试。
+"""
+
+import json
+import logging
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from app.settings import (
+    OAUTH_ADMIN_API_BASE_URL,
+    OAUTH_ADMIN_API_REFRESH_TOKEN,
+    OAUTH_ADMIN_API_TOKEN,
+    OAUTH_BIND_GROUP_IDS,
+    OAUTH_BIND_INFERENCE_BACKEND,
+    OAUTH_BIND_MAX_CONCURRENT,
+    OAUTH_BIND_MAX_RPM,
+    OAUTH_BIND_MAX_SESSIONS,
+    OAUTH_BIND_MAX_TPM,
+    OAUTH_BIND_OUTBOUND_PROXY_ID,
+    OAUTH_BIND_OUTBOUND_PROXY_MODE,
+    OAUTH_BIND_POLICY_TEMPLATE_ID,
+)
+
+logger = logging.getLogger(__name__)
+
+AUTH_URL_PATH = "/api/admin/oauth-accounts/auth-url"
+EXCHANGE_PATH = "/api/admin/oauth-accounts/exchange"
+
+
+def _refresh_access_token(base_url: str, refresh_token: str) -> str | None:
+    """用 refresh_token 刷新 access_token（与 disabled 模式同一接口）。"""
+    url = f"{base_url}/api/auth/refresh"
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Cookie": f"refresh_token={refresh_token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(text)
+            token = (data.get("accessToken")
+                     or data.get("access_token")
+                     or data.get("token")
+                     or (data.get("data") or {}).get("accessToken")
+                     or (data.get("data") or {}).get("access_token"))
+            if token:
+                logger.info("refresh_token 刷新成功，已获取新 access_token")
+                return token
+            for val in (resp.headers.get_all("Set-Cookie") or []):
+                if "access_token=" in val or "token=" in val:
+                    for part in val.split(";"):
+                        k, _, v = part.strip().partition("=")
+                        if k in ("access_token", "token") and v:
+                            return v
+            logger.warning(f"refresh 响应中未找到 token: {text[:300]}")
+            return None
+    except Exception as e:
+        logger.warning(f"refresh_token 刷新失败: {e}")
+        return None
+
+
+def _auth_headers(token: str) -> dict:
+    headers = {"Accept": "application/json"}
+    if token:
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _request(base_url: str, path: str, token: str, refresh_token: str = "",
+             method: str = "GET", body: dict = None) -> tuple:
+    """向 admin API 发请求，返回 (parsed_json, raw_text)。401 且有 refresh_token 时自动刷新重试一次。"""
+    url = f"{base_url}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else (b"" if method == "POST" else None)
+    headers = _auth_headers(token)
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            return (json.loads(text) if text.strip() else {}), text
+    except urllib.error.HTTPError as e:
+        status = e.code
+        err_text = e.read().decode("utf-8", errors="replace") if e.fp else str(e)
+        if status == 401 and refresh_token:
+            new_token = _refresh_access_token(base_url, refresh_token)
+            if new_token:
+                return _request(base_url, path, new_token, "", method, body)
+        raise RuntimeError(f"请求失败 [{status}] {path}: {err_text[:500]}")
+
+
+def get_access_token(base_url: str = None, token: str = None, refresh_token: str = None) -> str:
+    """拿到可用的 access_token：优先传入/配置的 token，否则用 refresh_token 刷新。"""
+    base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
+    token = token if token is not None else OAUTH_ADMIN_API_TOKEN
+    refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
+    if token:
+        return token
+    if refresh_token:
+        new_token = _refresh_access_token(base_url, refresh_token)
+        if new_token:
+            return new_token
+        raise RuntimeError("refresh_token 刷新失败，请检查 OAUTH_ADMIN_API_REFRESH_TOKEN 是否过期")
+    raise RuntimeError("未配置 OAUTH_ADMIN_API_TOKEN / OAUTH_ADMIN_API_REFRESH_TOKEN")
+
+
+def get_auth_url(base_url: str = None, token: str = None, refresh_token: str = None,
+                 provider: str = "anthropic", oauth_flow: str = "login",
+                 name: str = None) -> tuple:
+    """POST auth-url，返回 (auth_url, pending_state)。
+
+    请求体与后台前端一致（vendor 账号必须走 POST，GET 会 403 Not available for vendor accounts）：
+      {outbound_proxy_mode, outbound_proxy_id, provider, oauth_flow, name,
+       inference_backend, overwrite_existing}
+    返回体字段为 {url, state}（做了多名兼容）。
+    """
+    base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
+    token = token if token is not None else OAUTH_ADMIN_API_TOKEN
+    refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
+    body = {
+        "outbound_proxy_mode": OAUTH_BIND_OUTBOUND_PROXY_MODE,
+        "outbound_proxy_id": OAUTH_BIND_OUTBOUND_PROXY_ID,
+        "provider": provider,
+        "oauth_flow": oauth_flow,
+        "name": name,
+        "inference_backend": OAUTH_BIND_INFERENCE_BACKEND,
+        "overwrite_existing": False,
+    }
+    data, raw = _request(base_url, AUTH_URL_PATH, token, refresh_token, method="POST", body=body)
+
+    container = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), dict) else data
+    if not isinstance(container, dict):
+        raise RuntimeError(f"auth-url 响应无法解析: {raw[:500]}")
+
+    auth_url = (container.get("auth_url") or container.get("authUrl")
+                or container.get("authorize_url") or container.get("authorizeUrl")
+                or container.get("url"))
+    pending_state = (container.get("pending_state") or container.get("pendingState")
+                     or container.get("state"))
+
+    # 兜底：pending_state 没单独给，就从 auth_url 的 state 参数里取
+    if auth_url and not pending_state:
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
+            pending_state = (qs.get("state") or [None])[0]
+        except Exception:
+            pass
+
+    if not auth_url or not pending_state:
+        raise RuntimeError(f"auth-url 响应缺少 auth_url / pending_state: {raw[:500]}")
+    return auth_url, pending_state
+
+
+def exchange(code: str, pending_state: str, base_url: str = None,
+             token: str = None, refresh_token: str = None,
+             group_ids: list = None, policy_template_id: str = None) -> dict:
+    """POST exchange，用 code + pending_state 换取并落库。返回解析后的 JSON。"""
+    base_url = (base_url or OAUTH_ADMIN_API_BASE_URL).rstrip("/")
+    token = token if token is not None else OAUTH_ADMIN_API_TOKEN
+    refresh_token = refresh_token if refresh_token is not None else OAUTH_ADMIN_API_REFRESH_TOKEN
+    payload = {
+        "code": code,
+        "pending_state": pending_state,
+        "inference_backend": OAUTH_BIND_INFERENCE_BACKEND,
+        "outbound_proxy_mode": OAUTH_BIND_OUTBOUND_PROXY_MODE,
+        "outbound_proxy_id": OAUTH_BIND_OUTBOUND_PROXY_ID,
+        "max_rpm": OAUTH_BIND_MAX_RPM,
+        "max_tpm": OAUTH_BIND_MAX_TPM,
+        "max_concurrent": OAUTH_BIND_MAX_CONCURRENT,
+        "max_sessions": OAUTH_BIND_MAX_SESSIONS,
+        "group_ids": group_ids if group_ids is not None else OAUTH_BIND_GROUP_IDS,
+        "policy_template_id": policy_template_id if policy_template_id is not None else OAUTH_BIND_POLICY_TEMPLATE_ID,
+    }
+    data, raw = _request(base_url, EXCHANGE_PATH, token, refresh_token, method="POST", body=payload)
+    return data if isinstance(data, dict) else {"raw": raw}
