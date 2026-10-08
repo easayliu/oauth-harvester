@@ -23,10 +23,8 @@ from urllib.parse import urlsplit, unquote
 
 logger = logging.getLogger(__name__)
 
-# 进程内单例：同一个上游 URL 只起一个中转，复用其本地端口。
-_server = None
-_local_url = None
-_upstream_key = None
+# 进程内按上游 URL 缓存：同一个上游只起一个中转，复用其本地端口（代理池轮换时多个上游并存）。
+_relays: dict = {}  # upstream_url -> (server, local_url)
 
 
 async def ensure_relay(upstream_url: str):
@@ -35,8 +33,6 @@ async def ensure_relay(upstream_url: str):
     - upstream 不是 socks 或没有账号密码：无需中转，返回 None（调用方用原 URL）。
     - 已为同一 upstream 起过：直接复用，返回上次的本地 URL。
     """
-    global _server, _local_url, _upstream_key
-
     if not upstream_url:
         return None
     parts = urlsplit(upstream_url)
@@ -46,8 +42,8 @@ async def ensure_relay(upstream_url: str):
     if not (parts.username or parts.password):
         return None  # 无认证的 socks，浏览器本就支持，不用中转
 
-    if _server is not None and _upstream_key == upstream_url:
-        return _local_url  # 复用
+    if upstream_url in _relays:
+        return _relays[upstream_url][1]  # 复用
 
     up_host = parts.hostname
     up_port = parts.port
@@ -67,12 +63,11 @@ async def ensure_relay(upstream_url: str):
 
     server = await asyncio.start_server(handle, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    _server = server
-    _local_url = f"socks5://127.0.0.1:{port}"
-    _upstream_key = upstream_url
+    local_url = f"socks5://127.0.0.1:{port}"
+    _relays[upstream_url] = (server, local_url)
     logger.info("proxy_relay: 本地无认证 SOCKS5 中转已启动 %s → 上游 %s:%s（带认证，远程 DNS）",
-                _local_url, up_host, up_port)
-    return _local_url
+                local_url, up_host, up_port)
+    return local_url
 
 
 async def _handle_client(reader, writer, up_host, up_port, up_user, up_pass):

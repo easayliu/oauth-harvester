@@ -4,6 +4,7 @@
 
 HEADLESS = True                  # True=无头模式  False=可视化调试
 PROXY = ""                       # 代理，如 "socks5://host:port" 或 "http://user:pass@host:port"
+PROXY_POOL = []                  # 出口代理池：URL 列表或文件路径（每行一个）；配了则 claude-bind-session 按账号轮换，不再只用 PROXY
 PROXY_TEST_URL = "https://api.ipify.org"                                      # 测代理出口 IP 的地址（纯文本返回 IP）
 CAPSOLVER_API_KEY = ""           # CapSolver 打码（过 AWS WAF）；留空=手工点 Verify
 USE_SYSTEM_CHROME = True         # True=系统 Chrome（反检测最佳）  False=Playwright 自带 Chromium

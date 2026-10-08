@@ -14,6 +14,13 @@ try:
 except ImportError:
     KIRO_IDC_NEW_PASSWORD = "Kiro-Idc-New-2026!"
 
+# 浏览器出口代理池：URL 列表，或文件路径（每行一个）。配了则支持的模式（claude-bind-session）
+# 每个账号轮换一个代理，不再全部走 PROXY；留空则仍用 PROXY。
+try:
+    from config import PROXY_POOL
+except ImportError:
+    PROXY_POOL = []
+
 # 测代理出口 IP 的地址（纯文本返回 IP）。老 config.py 没有这项时兜底，避免退出。
 try:
     from config import PROXY_TEST_URL

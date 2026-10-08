@@ -71,8 +71,8 @@ def _proxy_settings(proxy_url: str = None):
     return cfg
 
 
-async def _proxy_settings_async():
-    """带本地中转的 _proxy_settings：浏览器内核用。
+async def _proxy_settings_async(proxy_url: str = None):
+    """带本地中转的 _proxy_settings：浏览器内核用。proxy_url 不传时用 config 的 PROXY。
 
     PROXY 是带认证的 socks5 时，浏览器内核不支持 —— 先用 proxy_relay 起一个本地
     无认证 SOCKS5 中转，把中转 URL（socks5://127.0.0.1:<port>，无账密）交给浏览器，
@@ -80,18 +80,20 @@ async def _proxy_settings_async():
     无认证 socks）直接走 _proxy_settings()。
     """
     from app.core.proxy_relay import ensure_relay
-    local = await ensure_relay(PROXY)
-    return _proxy_settings(local) if local else _proxy_settings()
+    url = proxy_url or PROXY
+    local = await ensure_relay(url)
+    return _proxy_settings(local or url)
 
 
-def check_proxy(timeout: float = 12.0):
-    """走 PROXY 请求 PROXY_TEST_URL，返回出口 IP（字符串）；未配代理或失败返回 None。
+def check_proxy(timeout: float = 12.0, proxy_url: str = None):
+    """走代理（proxy_url，不传时用 PROXY）请求 PROXY_TEST_URL，返回出口 IP（字符串）；未配代理或失败返回 None。
 
     做一次轻量自检验证代理可用并打印出口 IP。注意：SOCKS 代理必须把**主机名**
     原样交给代理做远程 DNS（等价 curl 的 socks5h）；若先在本地解析再交 IP，很多
     只认远程 DNS 的代理会直接拒绝。socks:// 需要 PySocks，没装则跳过自检。
     """
-    if not PROXY:
+    proxy_url = proxy_url or PROXY
+    if not proxy_url:
         logger.info("check_proxy: 未配置 PROXY，跳过")
         return None
 
@@ -104,7 +106,7 @@ def check_proxy(timeout: float = 12.0):
     port = tparts.port or (443 if tparts.scheme == "https" else 80)
     path = tparts.path or "/"
 
-    pparts = urlsplit(PROXY)
+    pparts = urlsplit(proxy_url)
     scheme = (pparts.scheme or "http").lower()
 
     try:
@@ -120,7 +122,7 @@ def check_proxy(timeout: float = 12.0):
             )
         else:
             # http(s) 代理：urllib ProxyHandler 原生支持（含账号密码），不用手搓 CONNECT
-            return _check_proxy_http(timeout)
+            return _check_proxy_http(timeout, proxy_url)
 
         sock.settimeout(timeout)
         sock.connect((host, port))  # 主机名交给代理（rdns）
@@ -151,11 +153,11 @@ def check_proxy(timeout: float = 12.0):
     return ip
 
 
-def _check_proxy_http(timeout):
+def _check_proxy_http(timeout, proxy_url):
     """http(s) 代理分支：用 urllib 的 ProxyHandler（原生支持账号密码）。"""
     import urllib.request
     try:
-        handler = urllib.request.ProxyHandler({"http": PROXY, "https": PROXY})
+        handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
         opener = urllib.request.build_opener(handler)
         ip = opener.open(PROXY_TEST_URL, timeout=timeout).read().decode().strip()
     except Exception as e:
@@ -165,7 +167,7 @@ def _check_proxy_http(timeout):
     return ip
 
 
-def _resolve_geoip(eff_geoip):
+def _resolve_geoip(eff_geoip, proxy_url: str = None):
     """geoip=True + socks 代理时，自己把出口 IP 先算出来，返回 IP 字符串给 camoufox。
 
     为什么要插手：camoufox 的 public_ip() 用 requests 走 `socks5://`（本地 DNS）请求
@@ -179,12 +181,13 @@ def _resolve_geoip(eff_geoip):
     """
     if eff_geoip is not True:
         return eff_geoip
-    if not PROXY:
+    proxy_url = proxy_url or PROXY
+    if not proxy_url:
         return True
     from urllib.parse import urlsplit
-    if not (urlsplit(PROXY).scheme or "").lower().startswith("socks"):
+    if not (urlsplit(proxy_url).scheme or "").lower().startswith("socks"):
         return True
-    ip = check_proxy()
+    ip = check_proxy(proxy_url=proxy_url)
     if ip:
         logger.info("geoip: 预解析出口 IP=%s，绕过 camoufox public_ip（socks 远程 DNS）", ip)
         return ip
@@ -192,11 +195,11 @@ def _resolve_geoip(eff_geoip):
     return True
 
 
-async def _resolve_geoip_async(eff_geoip):
+async def _resolve_geoip_async(eff_geoip, proxy_url: str = None):
     """_resolve_geoip 的异步包装：阻塞网络探测丢进 executor，避免卡事件循环。"""
     if eff_geoip is not True:
         return eff_geoip
-    return await asyncio.get_event_loop().run_in_executor(None, _resolve_geoip, eff_geoip)
+    return await asyncio.get_event_loop().run_in_executor(None, _resolve_geoip, eff_geoip, proxy_url)
 
 
 _PLAYWRIGHT_BACKEND = "cloakbrowser"
@@ -1127,13 +1130,15 @@ async def launch_camoufox_persistent_context(user_data_dir: str, *,
                                              timezone: str = None,
                                              os_name: str = None,
                                              geoip: bool = None,
-                                             headless: bool = None):
+                                             headless: bool = None,
+                                             proxy: str = None):
     """启动 Camoufox 持久化 context（替代 cloakbrowser.launch_persistent_context_async）。
     返回 (context, _cm_handle)。调用方 finally 里调 close_camoufox_persistent_context(_cm_handle)
     完整清理（关 context + Firefox 进程 + Playwright + 虚拟显示）。
 
     locale/timezone/os_name/geoip：可选覆盖，不传则取 config 的
     BROWSER_LOCALE / BROWSER_TIMEZONE / BROWSER_OS / BROWSER_GEOIP。
+    proxy：本次使用的代理 URL（如代理池轮换选出的），不传则用 config 的 PROXY。
 
     保持「先 await 拿 context、再 try/finally」的旧调用模式不变，避免业务逻辑大段缩进。
 
@@ -1145,11 +1150,11 @@ async def launch_camoufox_persistent_context(user_data_dir: str, *,
     from camoufox.async_api import AsyncCamoufox
     _seed_kiro_asset_cache(user_data_dir)
     w, h = _camoufox_window_size()
-    proxy_cfg = await _proxy_settings_async()
+    proxy_cfg = await _proxy_settings_async(proxy)
     headless_val = _camoufox_headless_value(headless)
     eff_locale = locale or BROWSER_LOCALE or "en-US"
     eff_os = os_name or BROWSER_OS or "windows"
-    eff_geoip = await _resolve_geoip_async(geoip if geoip is not None else BROWSER_GEOIP)
+    eff_geoip = await _resolve_geoip_async(geoip if geoip is not None else BROWSER_GEOIP, proxy)
     eff_tz = timezone or BROWSER_TIMEZONE
     logger.info(
         f"启动 Camoufox stealth Firefox 持久化 context "

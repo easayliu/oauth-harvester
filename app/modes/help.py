@@ -189,6 +189,7 @@ def print_help():
   --os=macos             OS 指纹伪装（仅 Camoufox）
   --geoip=false          关闭 IP 自动同步 tz/locale（仅 Camoufox）
   --proxy=socks5://h:p   代理（覆盖 config PROXY，支持 socks5/socks5h/http；claude-mail / chatgpt-mail 不走代理）
+  PROXY_POOL（config）   出口代理池（URL 列表或文件路径），claude-bind-session 按账号轮换、自动跳过不通的；--proxy 优先
   也可在 config.py 全局配置: BROWSER_LOCALE / BROWSER_TIMEZONE / BROWSER_OS / BROWSER_GEOIP
 
 说明:

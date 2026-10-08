@@ -1540,6 +1540,15 @@ async def _run_claude_bind_session_single(label, email_addr, session_key, *,
         screenshot_path as _screenshot_path,
     )
 
+    from app.core.proxy_pool import get_proxy_pool
+
+    # 出口代理：--proxy 优先；否则配了 PROXY_POOL 就按账号轮换；都没有则用 config 的 PROXY
+    proxy = overrides.get("proxy")
+    if not proxy:
+        pool = get_proxy_pool()
+        if pool:
+            proxy = await pool.next()
+
     # profile 目录按账号隔离；无 email 时用 sessionKey 尾段拼一个稳定标识
     profile_key = email_addr or f"session-{session_key[-12:]}@bind.local"
     profile_dir = get_kiro_profile_dir(profile_key, browser="firefox")
@@ -1550,6 +1559,7 @@ async def _run_claude_bind_session_single(label, email_addr, session_key, *,
         os_name=overrides.get("os_name"),
         geoip=overrides.get("geoip"),
         headless=overrides.get("headless"),
+        proxy=proxy,
     )
     success = False
     try:
