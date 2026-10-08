@@ -74,6 +74,7 @@ def print_help():
                   可临时用 --admin-token=<access_token> 覆盖后台 token
                   后端可切换（config: OAUTH_BIND_BACKEND）：
                     default = oauth-accounts 后台； luban = luban 服务（LUBAN_BASE_URL + LUBAN_ADMIN_PASSWORD）
+                    luban 出站代理：LUBAN_BIND_PROXY 填 URL，或 LUBAN_BIND_PROXY_ID 只填代理池 id
                   批量文件两种布局：
                     A) 首行 IMAP 服务器，其后每行 email:password（同邮箱域共享服务器，推荐）
                          glacier.mxrouting.net:993

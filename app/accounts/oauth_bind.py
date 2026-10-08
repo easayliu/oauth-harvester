@@ -34,6 +34,7 @@ from app.settings import (
     LUBAN_BASE_URL,
     LUBAN_BIND_LABEL,
     LUBAN_BIND_PROXY,
+    LUBAN_BIND_PROXY_ID,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,10 @@ ACCOUNT_POLICY_TEMPLATES_PATH = "/api/admin/account-policy-templates"
 # luban 后端的接口路径（鉴权为 Authorization: Bearer <管理员密码>）
 LUBAN_AUTHORIZE_PATH = "/api/authorize"
 LUBAN_EXCHANGE_PATH = "/api/exchange"
+LUBAN_PROXIES_PATH = "/api/proxies"
+
+# LUBAN_BIND_PROXY_ID 解析出的代理 URL，进程内只查一次
+_luban_proxy_url_cache: dict = {}
 
 
 def _state_from_url(url: str) -> str:
@@ -182,6 +187,9 @@ def _get_auth_url_luban() -> tuple:
 def _exchange_luban(code: str) -> dict:
     """luban：POST /api/exchange（Bearer 管理员密码），body {code, label?, proxy?}。
 
+    proxy 取 LUBAN_BIND_PROXY；为空时用 LUBAN_BIND_PROXY_ID 从代理池解析出 URL
+    （exchange 只认 URL，luban 按 URL 把账号关联回代理池那一条）。
+
     luban 的 exchange 从 code 自己解析 state，不需要单独传 pending_state；
     group/template/限额由 luban 用 /credentials 单独管理，此处不带。
     """
@@ -191,10 +199,36 @@ def _exchange_luban(code: str) -> dict:
     payload = {"code": code}
     if LUBAN_BIND_LABEL:
         payload["label"] = LUBAN_BIND_LABEL
-    if LUBAN_BIND_PROXY:
-        payload["proxy"] = LUBAN_BIND_PROXY
+    proxy = LUBAN_BIND_PROXY or _luban_proxy_url_by_id(base_url, LUBAN_BIND_PROXY_ID)
+    if proxy:
+        payload["proxy"] = proxy
     data, raw = _request(base_url, LUBAN_EXCHANGE_PATH, LUBAN_ADMIN_PASSWORD, "", method="POST", body=payload)
     return data if isinstance(data, dict) else {"raw": raw}
+
+
+def _luban_proxy_url_by_id(base_url: str, proxy_id) -> str | None:
+    """按 luban 代理池 id 查完整代理 URL（GET /api/proxies，管理员 Bearer 拿到的 URL 带密码）。"""
+    if proxy_id in (None, ""):
+        return None
+    try:
+        pid = int(proxy_id)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"LUBAN_BIND_PROXY_ID 不是整数: {proxy_id!r}")
+    if pid in _luban_proxy_url_cache:
+        return _luban_proxy_url_cache[pid]
+    data, raw = _request(base_url, LUBAN_PROXIES_PATH, LUBAN_ADMIN_PASSWORD, "", method="GET")
+    if not isinstance(data, list):
+        raise RuntimeError(f"luban /api/proxies 响应无法解析: {raw[:500]}")
+    for p in data:
+        if isinstance(p, dict) and p.get("id") == pid:
+            url = p.get("url")
+            if not url:
+                raise RuntimeError(f"luban 代理池 id={pid} 没有 url")
+            logger.info(f"luban 代理池 id={pid} ({p.get('label')}) 已解析为出站代理")
+            _luban_proxy_url_cache[pid] = url
+            return url
+    available = ", ".join(f"{p.get('id')}={p.get('label')}" for p in data if isinstance(p, dict)) or "（代理池为空）"
+    raise RuntimeError(f"luban 代理池里没有 id={pid}；可选: {available}")
 
 
 # ---------- default 后端：oauth-accounts 后台（POST auth-url + POST exchange） ----------

@@ -489,3 +489,8 @@ try:
     from config import LUBAN_BIND_PROXY
 except ImportError:
     LUBAN_BIND_PROXY = None
+# 只填代理池 id 也行：绑定前用 GET /api/proxies 解析成 URL 再传；LUBAN_BIND_PROXY 非空时以 URL 为准
+try:
+    from config import LUBAN_BIND_PROXY_ID
+except ImportError:
+    LUBAN_BIND_PROXY_ID = None

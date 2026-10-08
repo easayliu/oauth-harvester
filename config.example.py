@@ -222,6 +222,7 @@ LUBAN_BASE_URL                 = "http://127.0.0.1:4600"   # luban 地址（默�
 LUBAN_ADMIN_PASSWORD           = ""      # luban 网页「接入设置」里设的管理员密码（作 Bearer）
 LUBAN_BIND_LABEL               = None    # exchange 可选显示名；留空由 luban 自动命名
 LUBAN_BIND_PROXY               = None    # exchange 可选出站代理；留空直连
+LUBAN_BIND_PROXY_ID            = None    # 或只填 luban 代理池 id（网页「代理池」里的 id），自动解析成 URL；上面 URL 非空时以 URL 为准
 
 # ═══════════════════════════════════════════════════════════════════
 # MXroute 邮箱 API（python main.py email）
