@@ -52,6 +52,12 @@ def _parse_browser_cli_overrides(extra_args: list[str] = None) -> dict:
             overrides["geoip"] = arg.split("=", 1)[1].lower() not in ("false", "0", "no", "off")
         elif arg.startswith("--proxy="):
             overrides["proxy"] = arg.split("=", 1)[1]
+        elif arg == "--headless":
+            overrides["headless"] = True
+        elif arg == "--no-headless":
+            overrides["headless"] = False
+        elif arg.startswith("--headless="):
+            overrides["headless"] = arg.split("=", 1)[1].lower() not in ("false", "0", "no", "off")
     return overrides
 
 
@@ -324,11 +330,71 @@ def _extract_chatgpt_code(body: str) -> str:
     return re.sub(r"\s", "", spaced.group(1)) if spaced else ""
 
 
-def _imap_latest_uid(host: str, port: int, email_addr: str, app_password: str) -> int:
+# 微软个人号（Outlook/Hotmail）token 端点：卡密里带 ClientId + refresh_token 时走
+# OAuth2，个人号用 /consumers；换到的 access_token 供 IMAP XOAUTH2 登录用。
+_MS_TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+_MS_IMAP_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+
+
+def _ms_oauth_access_token(client_id: str, refresh_token: str) -> str:
+    """用微软 refresh_token 换 IMAP access_token（Outlook/Hotmail 个人号 XOAUTH2 用）。
+
+    个人版 Outlook 关闭了密码/basic-auth IMAP，必须用 OAuth2 的 access_token 走 XOAUTH2。
+    卡密格式里第 3、4 段就是 ClientId 和 refresh_token。失败返回空串。"""
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    data = urllib.parse.urlencode({
+        "client_id": client_id,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "scope": _MS_IMAP_SCOPE,
+    }).encode()
+    req = urllib.request.Request(
+        _MS_TOKEN_URL, data=data, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode())
+        tok = body.get("access_token", "")
+        if tok:
+            logger.info("微软 refresh_token 换取 IMAP access_token 成功")
+        else:
+            logger.warning(f"微软 token 响应无 access_token: {str(body)[:200]}")
+        return tok
+    except urllib.error.HTTPError as e:
+        try:
+            err = e.read().decode()
+        except Exception:
+            err = str(e)
+        logger.warning(f"微软 token 换取失败 HTTP {e.code}: {err[:300]}")
+        return ""
+    except Exception as e:
+        logger.warning(f"微软 token 换取异常: {e}")
+        return ""
+
+
+def _imap_login(imap, email_addr: str, app_password: str = "", access_token: str = ""):
+    """统一 IMAP 登录：有 access_token 走 XOAUTH2（Outlook 个人号），否则用密码。
+
+    注意 imaplib.authenticate 的回调需返回原始字节串，base64 由 imaplib 自己做。"""
+    if access_token:
+        imap.authenticate(
+            "XOAUTH2",
+            lambda _: f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01".encode(),
+        )
+    else:
+        imap.login(email_addr, app_password)
+
+
+def _imap_latest_uid(host: str, port: int, email_addr: str, app_password: str,
+                     access_token: str = "") -> int:
     """记录触发发信前 INBOX 里的最大 UID，作为「只认新邮件」的基准线。失败返回 0。"""
     try:
         with imaplib.IMAP4_SSL(host, port, timeout=30) as imap:
-            imap.login(email_addr, app_password)
+            _imap_login(imap, email_addr, app_password, access_token)
             imap.select("INBOX")
             typ, data = imap.uid("search", None, "ALL")
             ids = data[0].split() if typ == "OK" and data and data[0] else []
@@ -342,7 +408,7 @@ def _imap_wait_new_magic_link(host: str, port: int, email_addr: str, app_passwor
                               baseline_uid: int,
                               timeout_s: int = 180, poll_interval_s: int = 6,
                               sender: str = "anthropic", kind: str = "link",
-                              delete: bool = False) -> str:
+                              delete: bool = False, access_token: str = "") -> str:
     """轮询 IMAP，只在 UID 大于 baseline 的新登录邮件里找登录凭据。
     sender 为发件人过滤关键字（claude→anthropic，chatgpt→openai）。
     kind="link" 返回 magic link 完整 URL；kind="code" 返回数字验证码。超时返回空串。
@@ -355,7 +421,7 @@ def _imap_wait_new_magic_link(host: str, port: int, email_addr: str, app_passwor
     while time.time() < end:
         try:
             with imaplib.IMAP4_SSL(host, port, timeout=30) as imap:
-                imap.login(email_addr, app_password)
+                _imap_login(imap, email_addr, app_password, access_token)
                 imap.select("INBOX")
                 typ, data = imap.uid("search", None, f'(FROM "{sender}")')
                 ids = data[0].split() if typ == "OK" and data and data[0] else []
@@ -757,15 +823,46 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
             logger.info(f"授权中... ({(i+1)*2}s) URL: {cur}")
             last_url = cur
 
+        # 2.5) 邀请拦截页：authorize 前先被跳到 /invites?returnTo=%2Foauth%2Fauthorize...，
+        #      需先点 "Accept invite" 才会带着 returnTo 继续回到 /oauth/authorize 同意页。
+        try:
+            if "/invites" in page.url:
+                invite_btn = page.locator(
+                    'button:has-text("Accept invite"), button:has-text("Accept"), '
+                    'button:has-text("接受"), a:has-text("Accept invite")'
+                )
+                if (await invite_btn.count() > 0 and await invite_btn.first.is_visible()
+                        and await invite_btn.first.is_enabled()):
+                    await invite_btn.first.click(timeout=3000)
+                    logger.info("已点击 Accept invite，等待回到授权页")
+                    try:
+                        await page.wait_for_url(
+                            lambda u: "/invites" not in u,
+                            wait_until="commit", timeout=15000)
+                    except Exception:
+                        pass
+                    continue
+        except Exception as e:
+            logger.debug(f"点击 Accept invite 异常: {e}")
+
         # 3) 点授权按钮（仅限 /oauth/authorize 同意页；跳到 callback 后页面上不会再有）
         try:
             if "/oauth/authorize" in page.url:
                 btn = page.locator(authorize_btn)
-                if await btn.count() > 0 and await btn.first.is_visible():
-                    await btn.first.click()
+                if (await btn.count() > 0 and await btn.first.is_visible()
+                        and await btn.first.is_enabled()):
+                    # 必须给短超时：点完后按钮会变 disabled/「Authorizing...」（同样命中
+                    # has-text("Authorize")），重复点击会按默认 30s 等它可点，白等 30s
+                    await btn.first.click(timeout=3000)
                     logger.info("已点击授权按钮")
                     clicked = True
-                    await page.wait_for_timeout(2500)
+                    # 直接等离开同意页（回跳 callback），一跳走就进下一轮从 URL 抓码
+                    try:
+                        await page.wait_for_url(
+                            lambda u: "/oauth/authorize" not in u,
+                            wait_until="commit", timeout=15000)
+                    except Exception:
+                        pass
                     continue
         except Exception as e:
             logger.debug(f"点击授权按钮异常: {e}")
@@ -934,27 +1031,49 @@ async def _claude_extract_session_and_bind(page, context, email_addr, app_passwo
 
 
 async def _claude_email_magic_login(page, email_addr, app_password, imap_host, imap_port,
-                                    *, delete_after=False, interactive=True) -> bool:
+                                    *, delete_after=False, interactive=True,
+                                    client_id="", refresh_token="",
+                                    skip_landing_goto=False) -> bool:
     """邮箱 magic-link 登录：打开 /login → 填邮箱提交 → IMAP 抓 magic link → 打开 →
     推进注册引导直到进入 /new。首登与 reauth 重登共用。
+
+    client_id + refresh_token：Outlook/Hotmail 个人号用（卡密第 3、4 段），有则换
+    access_token 走 IMAP XOAUTH2（个人号不支持密码 IMAP）；否则用 app_password 密码登录。
+
+    skip_landing_goto：reauth 重登用。被强制登出时页面已停在
+    /login?reauth=1&returnTo=%2Foauth%2Fauthorize... 的邮箱输入页（带 returnTo），
+    直接在当前页填邮箱即可；若再 goto 空的 /login 会丢掉 returnTo，登录后回不到授权页。
 
     返回 True 表示 magic link 已成功打开（调用方可继续提取 sessionKey）；
     返回 False 为硬失败（没找到输入框 / 没抓到登录链接），应中止。"""
     from app.core.browser import human_delay, screenshot_path as _screenshot_path
     from app.accounts.claude import _claude_advance_onboarding
 
+    # Outlook 个人号：先用 refresh_token 换一次 IMAP access_token，整个登录过程复用
+    access_token = ""
+    if client_id and refresh_token:
+        access_token = await asyncio.to_thread(
+            _ms_oauth_access_token, client_id, refresh_token)
+        if not access_token:
+            logger.error("微软 refresh_token 换取 access_token 失败，无法 IMAP 取件")
+            return False
+
     # 抓本次登录前的收件箱基准 UID（紧挨提交，确保只认新到的登录邮件）
     baseline_uid = await asyncio.to_thread(
-        _imap_latest_uid, imap_host, imap_port, email_addr, app_password)
+        _imap_latest_uid, imap_host, imap_port, email_addr, app_password, access_token)
     logger.info(f"收件箱基准 UID={baseline_uid}")
 
     # 1. 打开 Claude 登录页（SPA + 代理下 domcontentloaded 易超时，用 commit 提速）
-    logger.info("正在打开 claude.ai/login...")
-    try:
-        await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
-    except Exception as e:
-        logger.warning(f"打开 claude.ai/login 超时/失败，重试一次: {e}")
-        await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
+    if skip_landing_goto:
+        # reauth 重登：当前已在带 returnTo 的登录页，不再 goto（否则丢 returnTo）
+        logger.info(f"复用当前重登页（保留 returnTo），不再打开 claude.ai/login，当前 URL: {page.url}")
+    else:
+        logger.info("正在打开 claude.ai/login...")
+        try:
+            await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
+        except Exception as e:
+            logger.warning(f"打开 claude.ai/login 超时/失败，重试一次: {e}")
+            await page.goto("https://claude.ai/login", wait_until="commit", timeout=45000)
     await human_delay(page, "navigate")
     await page.screenshot(path=_screenshot_path("email_landing", email_addr))
 
@@ -1003,7 +1122,7 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
     logger.info("等待登录邮件（最长 5 分钟）...")
     magic_link = await asyncio.to_thread(
         _imap_wait_new_magic_link, imap_host, imap_port, email_addr, app_password,
-        baseline_uid, 300, 6, "anthropic", "link", delete_after,
+        baseline_uid, 300, 6, "anthropic", "link", delete_after, access_token,
     )
     if not magic_link:
         logger.warning("未抓到登录链接")
@@ -1037,6 +1156,17 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
         if "claude.ai/new" in current_url or "claude.ai/chat" in current_url:
             logger.info(f"已进入 Claude 对话页面！URL: {current_url}")
             break
+        # reauth 重登：magic link 带 returnTo 会直接回跳 /oauth/authorize（不经过 /new）。
+        # 只要已拿到 sessionKey 且离开登录/登出页，即视为登录完成，授权交给上层重试。
+        if ("/login" not in current_url and "/logout" not in current_url
+                and "/oauth/authorize" in current_url):
+            try:
+                cks = await page.context.cookies("https://claude.ai")
+            except Exception:
+                cks = []
+            if any(c.get("name") == "sessionKey" and c.get("value") for c in cks):
+                logger.info(f"重登已拿到 sessionKey 并回到授权页，URL: {current_url}")
+                break
 
         if current_url != last_url:
             logger.info(f"等待登录完成... ({(i+1)*3}s) URL: {current_url}")
@@ -1207,6 +1337,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
         timezone=overrides.get("timezone"),
         os_name=overrides.get("os_name"),
         geoip=overrides.get("geoip"),
+        headless=overrides.get("headless"),
     )
     success = False  # 该账号是否整体成功（含 bind）；供批量统计与末尾汇总失败账号
     try:
@@ -1218,7 +1349,8 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
             async def _relogin():
                 return await _claude_email_magic_login(
                     page, email_addr, app_password, imap_host, imap_port,
-                    delete_after=delete_after, interactive=False)
+                    delete_after=delete_after, interactive=False,
+                    skip_landing_goto=True)
 
             # 0. 已登录检测：该 profile 已登录 claude 则跳过整个邮箱 magic link 登录，
             #    直接提取 sessionKey（并按需加入后台）。
@@ -1268,6 +1400,227 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 input("流程结束，按回车键关闭浏览器...")
             except (EOFError, KeyboardInterrupt):
                 pass
+    finally:
+        await close_camoufox_persistent_context(cm)
+    return success
+
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _parse_session_bind_targets(raw_input: str, is_file: bool) -> list:
+    """收集 claude-bind-session 的待绑定目标，
+    返回 [(label, email, session_key, client_id, refresh_token), ...]。
+
+    支持：
+      · 完整卡密 邮箱----密码----ClientId----令牌----辅助邮箱----辅助密码----sk
+        （ClientId+令牌 供 Outlook 个人号重登时走 IMAP XOAUTH2 取 magic-link）
+      · email----sessionKey（email 仅作标签 / 落库名；无 ClientId 则重登不可用）
+      · 纯 sk-ant-... sessionKey（无 email，label 取 key 前缀）
+      · cookie JSON（以 [ 或 { 开头：单个 jar / 数组的数组 / JSONL），取每个 jar 的 sessionKey
+    """
+    from app.core.parsing import extract_sessionkeys_from_text
+
+    content = ""
+    if is_file:
+        with open(raw_input, "r", encoding="utf-8") as f:
+            content = f.read()
+    else:
+        content = raw_input or ""
+    cstrip = content.strip()
+    if not cstrip:
+        return []
+
+    targets = []
+    if cstrip[:1] in ("[", "{"):
+        # cookie JSON：只取每个 jar 里 name==sessionKey 的 value（无 email / ClientId）
+        for i, sk in enumerate(extract_sessionkeys_from_text(content), 1):
+            targets.append((f"cookie-json#{i}", "", sk, "", ""))
+        return targets
+
+    for line in cstrip.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # sk 用正则直接定位（key 内含 -- 但不含 ----，不会被字段分隔符截断）
+        m = re.search(r"sk-ant-(?:(?!----)\S)+", line)
+        if not m:
+            logger.warning(f"解析失败，跳过（未找到 sk-ant-）: {line[:40]}")
+            continue
+        sk = m.group(0)
+        remainder = line[:m.start()] + line[m.end():]
+        parts = [p.strip() for p in remainder.split("----") if p.strip()]
+        email = next((p for p in parts if "@" in p), "")  # 首个含 @ 的即主邮箱
+        client_id = next((p for p in parts if _UUID_RE.match(p)), "")
+        refresh_token = ""
+        if client_id:
+            ci = parts.index(client_id)
+            if ci + 1 < len(parts):  # 令牌紧跟在 ClientId 之后
+                refresh_token = parts[ci + 1]
+        targets.append((email or sk[:16], email, sk, client_id, refresh_token))
+    return targets
+
+
+async def run_claude_bind_session(mode: str, raw_input: str, is_file: bool):
+    """用 sessionKey 直接把账号绑定到后台，完全不走邮箱 magic-link 登录。
+
+    流程：Camoufox 持久化 context 注入 sessionKey cookie → 验证已登录 →
+    拉授权链接、在同一浏览器完成 OAuth 授权 → 调用后台 exchange 落库（oauth-accounts）。
+    适合手里已有 sessionKey、无需再跑新账号邮箱登录的账号。
+
+    输入（单条或文件批量，每行一条）：
+      · email----sessionKey      （推荐；email 仅作标签 / 落库名）
+      · 纯 sk-ant-... sessionKey  （无 email，标签取 key 前缀）
+      · cookie JSON（[..]/{..}）  （取 jar 里 name==sessionKey 的 value）
+    参数：--admin-token=<后台access_token> 复用；--per-account-timeout=<秒> 单账号硬上限。
+    """
+    admin_token = next((a.split("=", 1)[1] for a in sys.argv[3:]
+                        if a.startswith("--admin-token=")), None)
+    overrides = _parse_browser_cli_overrides()
+
+    targets = _parse_session_bind_targets(raw_input, is_file)
+    if not targets:
+        print("未解析到任何 sessionKey。支持：email----sessionKey（单条/文件每行一条）、"
+              "纯 sk-ant- 开头的 sessionKey、或 cookie JSON。")
+        exit(1)
+
+    total = len(targets)
+    logger.info(f"claude-bind-session：共 {total} 个 sessionKey 待绑定")
+    per_acct_timeout = next(
+        (int(a.split("=", 1)[1]) for a in sys.argv[3:]
+         if a.startswith("--per-account-timeout=")), 900)
+    ok = 0
+    failed = []  # [(label, 原因)]
+    for idx, (label, email_addr, sk, client_id, refresh_token) in enumerate(targets, 1):
+        logger.info(f"========== [{idx}/{total}] {label} ==========")
+        try:
+            done = await asyncio.wait_for(
+                _run_claude_bind_session_single(
+                    label, email_addr, sk, admin_token=admin_token,
+                    overrides=overrides, interactive=(total == 1),
+                    client_id=client_id, refresh_token=refresh_token),
+                timeout=per_acct_timeout)
+            if done:
+                ok += 1
+            else:
+                logger.warning(f"[{idx}/{total}] {label} 未成功绑定，跳过")
+                failed.append((label, "未成功绑定"))
+        except asyncio.TimeoutError:
+            logger.error(f"[{idx}/{total}] {label} 超过单账号时限 {per_acct_timeout}s，跳过")
+            failed.append((label, f"超时(>{per_acct_timeout}s)"))
+        except Exception as e:
+            logger.error(f"[{idx}/{total}] {label} 处理失败: {e}")
+            failed.append((label, f"异常: {e}"))
+
+    logger.info(f"批量完成：成功 {ok}/{total}（失败 {len(failed)}）")
+    if failed:
+        lines = "\n".join(f"  {l}\t{r}" for l, r in failed)
+        logger.warning(f"以下 {len(failed)} 个未成功绑定/失败：\n{lines}")
+        try:
+            with open("bind_failed.txt", "w") as f:
+                for l, r in failed:
+                    f.write(f"{l}----{r}\n")
+            logger.info("失败账号已写入 bind_failed.txt")
+        except Exception as e:
+            logger.debug(f"写失败账号文件出错: {e}")
+
+
+async def _run_claude_bind_session_single(label, email_addr, session_key, *,
+                                          admin_token, overrides, interactive=True,
+                                          client_id="", refresh_token=""):
+    """单个 sessionKey：注入 cookie → 验证登录 → OAuth 授权绑定落库。返回是否成功。
+
+    client_id + refresh_token（卡密第 3、4 段）：授权被强制登出时用它走 Outlook
+    IMAP XOAUTH2 取 magic-link 重登一次再重试；没有则被登出即跳过。"""
+    from app.core.browser import (
+        get_kiro_profile_dir,
+        launch_camoufox_persistent_context,
+        close_camoufox_persistent_context,
+        screenshot_path as _screenshot_path,
+    )
+
+    # profile 目录按账号隔离；无 email 时用 sessionKey 尾段拼一个稳定标识
+    profile_key = email_addr or f"session-{session_key[-12:]}@bind.local"
+    profile_dir = get_kiro_profile_dir(profile_key, browser="firefox")
+    context, cm = await launch_camoufox_persistent_context(
+        profile_dir,
+        locale=overrides.get("locale"),
+        timezone=overrides.get("timezone"),
+        os_name=overrides.get("os_name"),
+        geoip=overrides.get("geoip"),
+        headless=overrides.get("headless"),
+    )
+    success = False
+    try:
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        # 注入 sessionKey cookie（同时覆盖 .claude.ai 和 .claude.com）
+        for domain in (".claude.ai", ".claude.com"):
+            try:
+                await context.add_cookies([{
+                    "name": "sessionKey",
+                    "value": session_key,
+                    "domain": domain,
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                    "sameSite": "Lax",
+                }])
+            except Exception as e:
+                logger.debug(f"写 sessionKey cookie 到 {domain} 失败: {e}")
+
+        logger.info("验证 sessionKey 登录状态...")
+        if not await _claude_profile_logged_in(page, context):
+            logger.warning(f"sessionKey 无效 / 已过期（未登录），跳过: {label}")
+            await page.screenshot(path=_screenshot_path("bind_session_invalid", profile_key))
+            try:
+                with open("session_invalid.txt", "a") as f:
+                    f.write(f"{label}----{session_key}\n")
+            except Exception:
+                pass
+            return False
+        logger.info("sessionKey 已登录，开始 OAuth 授权绑定...")
+
+        # relogin 回调：授权被强制登出时，用卡密的 ClientId+refresh_token 走 Outlook
+        # IMAP XOAUTH2 取 magic-link 重登一次。无 ClientId/refresh_token 或非邮箱则不提供。
+        relogin = None
+        if email_addr and client_id and refresh_token:
+            imap_host = _imap_host_for_domain(email_addr.rsplit("@", 1)[-1])
+            imap_port = _IMAP_DEFAULT_PORT
+
+            async def relogin():
+                return await _claude_email_magic_login(
+                    page, email_addr, "", imap_host, imap_port,
+                    delete_after=True, interactive=False,
+                    client_id=client_id, refresh_token=refresh_token,
+                    skip_landing_goto=True)
+
+        try:
+            success = await _bind_account_to_backend(
+                page, email_addr or label, _screenshot_path,
+                admin_token=admin_token, relogin=relogin)
+        except _AccountOnHold:
+            logger.warning(f"账号被 hold/restricted，直接跳过: {label}")
+            print(f"\n[skip] 账号被 hold/restricted（account_on_hold），已跳过: {label}\n")
+            try:
+                with open("hold_accounts.txt", "a") as f:
+                    f.write(f"{label}----{session_key}\n")
+            except Exception:
+                pass
+            success = False
+
+        if interactive and sys.stdin.isatty():
+            try:
+                input("流程结束，按回车键关闭浏览器...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+    except Exception as e:
+        logger.error(f"执行过程中出错: {e}")
+        try:
+            await page.screenshot(path=_screenshot_path("bind_session_error", profile_key))
+        except Exception:
+            pass
     finally:
         await close_camoufox_persistent_context(cm)
     return success

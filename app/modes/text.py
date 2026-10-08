@@ -272,6 +272,7 @@ async def run_emails(mode: str, raw_input: str, is_file: bool):
     extra = sys.argv[3:]
     out_write_inplace = "--write" in extra
     unique = "--unique" in extra
+    comma = "--comma" in extra  # 逗号分隔输出成一整行（a@x,b@y,...），默认按行
     out_path = None
     if "--out" in extra:
         i = extra.index("--out")
@@ -287,6 +288,7 @@ async def run_emails(mode: str, raw_input: str, is_file: bool):
         if not raw_input.strip():
             print("用法: python main.py emails <账号文件>            # 抽出纯邮箱(默认打印预览)")
             print("     python main.py emails <账号文件> --unique   # 去重(保序)")
+            print("     python main.py emails <账号文件> --comma    # 逗号分隔成一整行(a@x,b@y,...)")
             print("     python main.py emails <账号文件> --out emails.txt   # 写到新文件")
             print("     python main.py emails <账号文件> --write     # 覆盖原文件为纯邮箱列表")
             print("     python main.py emails 'a@b.com----pwd----...'        # 单条也支持")
@@ -312,7 +314,8 @@ async def run_emails(mode: str, raw_input: str, is_file: bool):
         seen.add(addr)
         emails.append(addr)
 
-    output = "\n".join(emails) + ("\n" if emails else "")
+    sep = "," if comma else "\n"
+    output = sep.join(emails) + ("\n" if emails else "")
 
     if out_write_inplace:
         if not is_file:

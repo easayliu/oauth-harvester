@@ -1016,17 +1016,21 @@ async def cloak_browser_session(maximized: bool = False):
 # ============================================================
 
 
-def _camoufox_headless_value():
+def _camoufox_headless_value(force: bool = None):
     """决定 AsyncCamoufox 的 headless 参数值。
 
-      - HEADLESS=False：headless=False（GUI 可见）—— macOS dev 调试用
-      - HEADLESS=True + Linux：headless="virtual" —— 内置 Xvfb 虚拟显示，
+    force：按次覆盖 config 的 HEADLESS。None=用 config；True/False=强制开/关无头
+    （命令行 --headless / --no-headless 走这里）。
+
+      - 无头关：headless=False（GUI 可见）—— macOS dev 调试用
+      - 无头开 + Linux：headless="virtual" —— 内置 Xvfb 虚拟显示，
         服务器无 X11 时仍能跑 humanize/canvas/WebGL（真 headless 会被检测）
-      - HEADLESS=True + macOS/Windows：headless=True —— Camoufox 的 "virtual"
+      - 无头开 + macOS/Windows：headless=True —— Camoufox 的 "virtual"
         仅支持 Linux（"Virtual display is only supported on Linux."），其它平台
         退化到普通无头模式
     """
-    if not HEADLESS:
+    on = HEADLESS if force is None else force
+    if not on:
         return False
     if platform.system() == "Linux":
         return "virtual"
@@ -1122,7 +1126,8 @@ async def launch_camoufox_persistent_context(user_data_dir: str, *,
                                              locale: str = None,
                                              timezone: str = None,
                                              os_name: str = None,
-                                             geoip: bool = None):
+                                             geoip: bool = None,
+                                             headless: bool = None):
     """启动 Camoufox 持久化 context（替代 cloakbrowser.launch_persistent_context_async）。
     返回 (context, _cm_handle)。调用方 finally 里调 close_camoufox_persistent_context(_cm_handle)
     完整清理（关 context + Firefox 进程 + Playwright + 虚拟显示）。
@@ -1141,7 +1146,7 @@ async def launch_camoufox_persistent_context(user_data_dir: str, *,
     _seed_kiro_asset_cache(user_data_dir)
     w, h = _camoufox_window_size()
     proxy_cfg = await _proxy_settings_async()
-    headless_val = _camoufox_headless_value()
+    headless_val = _camoufox_headless_value(headless)
     eff_locale = locale or BROWSER_LOCALE or "en-US"
     eff_os = os_name or BROWSER_OS or "windows"
     eff_geoip = await _resolve_geoip_async(geoip if geoip is not None else BROWSER_GEOIP)
