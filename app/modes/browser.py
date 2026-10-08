@@ -534,8 +534,10 @@ async def run_claude_mail(mode: str, raw_input: str, is_file: bool):
     chrome_locale = overrides.get("locale") or BROWSER_LOCALE
     if chrome_locale:
         args.append(f"--lang={chrome_locale}")
-    chrome_proxy = overrides.get("proxy") or PROXY
-    args.extend(_chrome_proxy_args(chrome_proxy))
+    # 本模式不走代理（config PROXY / --proxy 都忽略）：subprocess 真 Chrome 的
+    # --proxy-server 不支持认证代理，带上反而报错、影响使用，直接用本机网络
+    if overrides.get("proxy"):
+        logger.info(f"{mode} 不支持代理，已忽略 --proxy")
     args.append(flavor["login_url"])
 
     chrome_env = None
@@ -545,8 +547,7 @@ async def run_claude_mail(mode: str, raw_input: str, is_file: bool):
 
     logger.info(f"subprocess 启动真 Chrome（无任何自动化痕迹）profile={profile_dir}"
                 f"{f' lang={chrome_locale}' if chrome_locale else ''}"
-                f"{f' tz={chrome_tz}' if chrome_tz else ''}"
-                f"{f' proxy={chrome_proxy}' if chrome_proxy else ''}")
+                f"{f' tz={chrome_tz}' if chrome_tz else ''}")
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      env=chrome_env)
 
