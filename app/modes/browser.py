@@ -1152,9 +1152,46 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
     last_url = ""
     unrecognized_streak = 0
     manual_warned = False
+    magic_stuck = 0      # 连续停在 /magic-link 验证页的轮数
+    magic_retried = False
     for i in range(120):
         await page.wait_for_timeout(3000)
         current_url = page.url
+        # magic-link 验证页正常几秒就跳走；一直转圈说明验证没走通，别空等 6 分钟：
+        # 已有 sessionKey → 直接去 /new；否则重开一次链接；还不行就截图失败
+        if "claude.ai/magic-link" in current_url:
+            magic_stuck += 1
+            if magic_stuck % 6 == 0:  # 每 18s 处理一次
+                try:
+                    cks = await page.context.cookies("https://claude.ai")
+                except Exception:
+                    cks = []
+                if any(c.get("name") == "sessionKey" and c.get("value") for c in cks):
+                    logger.info("magic-link 页未跳转但已拿到 sessionKey，直接打开 /new")
+                    try:
+                        await page.goto("https://claude.ai/new", wait_until="commit", timeout=30000)
+                    except Exception as e:
+                        logger.warning(f"打开 /new 失败: {e}")
+                    continue
+                if not magic_retried:
+                    magic_retried = True
+                    logger.warning(f"magic-link 验证页卡住 {magic_stuck * 3}s，重新打开登录链接...")
+                    await page.screenshot(path=_screenshot_path("magic_link_stuck", email_addr))
+                    try:
+                        await page.goto(magic_link, wait_until="commit", timeout=45000)
+                    except Exception as e:
+                        logger.warning(f"重开 magic link 失败: {e}")
+                    continue
+                try:
+                    text = (await page.locator("body").inner_text(timeout=3000)).strip()
+                except Exception:
+                    text = ""
+                logger.warning(f"magic-link 验证页卡住 {magic_stuck * 3}s 仍未登录，放弃。"
+                               f"页面文本: {text[:200]!r}")
+                await page.screenshot(path=_screenshot_path("magic_link_failed", email_addr))
+                return False
+        else:
+            magic_stuck = 0
         # 账号被 hold/restricted（access_denied / account_on_hold）→ 立即跳过，别空等
         if _is_account_restricted_url(current_url):
             logger.warning(f"账号被 hold/restricted，URL={current_url}")
