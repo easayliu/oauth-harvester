@@ -17,11 +17,17 @@ import re
 import subprocess
 import sys
 import time
-from email.header import decode_header as _decode_header
 from urllib.parse import parse_qs, urlparse
 
 from app.core.browser import _CHROME_APP_BIN, get_kiro_profile_dir
 from app.core.imap import imap_delete_uid
+# 登录邮件的解析逻辑统一复用 email inbox 那套完整实现（支持 Proofpoint 网关还原、
+# HTML 实体、QP 软换行），避免 browser 这边的删减版抓不到被改写的登录链接。
+from app.modes.mxroute import (
+    _decode_mime_header,
+    _extract_body as _extract_email_body,
+    _extract_claude_link,
+)
 from app.settings import BROWSER_LOCALE, BROWSER_TIMEZONE, PROXY
 
 logger = logging.getLogger(__name__)
@@ -287,68 +293,6 @@ async def run_chrome(mode: str, raw_input: str, is_file: bool):
 #   · yahoo 登录 → imap.mail.yahoo.com:993 IMAP4_SSL（同 main.py 的 yahoo 模式）。
 # 抓到链接、打开后不关闭浏览器，剩余动作由人工在页面继续操作。
 # ============================================================
-
-
-def _decode_mime_header(raw: str) -> str:
-    """解码 MIME 编码的邮件头（Subject / From 等）"""
-    parts = []
-    for fragment, charset in _decode_header(raw or ""):
-        if isinstance(fragment, bytes):
-            parts.append(fragment.decode(charset or "utf-8", errors="replace"))
-        else:
-            parts.append(fragment)
-    return "".join(parts)
-
-
-def _extract_email_body(msg) -> str:
-    """从 email.message.Message 提取正文（优先 text/html，其次 text/plain）"""
-    if msg.is_multipart():
-        html = ""
-        text = ""
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype not in ("text/plain", "text/html"):
-                continue
-            try:
-                payload = part.get_payload(decode=True) or b""
-                charset = part.get_content_charset() or "utf-8"
-                body = payload.decode(charset, errors="replace")
-            except Exception:
-                continue
-            if ctype == "text/html" and not html:
-                html = body
-            elif ctype == "text/plain" and not text:
-                text = body
-        return html or text
-    payload = msg.get_payload(decode=True) or b""
-    charset = msg.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, errors="replace")
-    except Exception:
-        return payload.decode("utf-8", errors="replace")
-
-
-def _extract_claude_link(body: str) -> str:
-    """从邮件正文中提取 Claude 或 ChatGPT 登录链接（过滤静态资源与跟踪域）"""
-    url_re = re.compile(
-        r"https://(?:[a-zA-Z0-9_-]+\.)*(?:claude\.ai|claude\.com|anthropic\.com|openai\.com|chatgpt\.com)/[^\s\"'<>()]+",
-        re.IGNORECASE,
-    )
-    # 结尾允许跟 ? 、) 、逗号或字符串结束，避免像 ....woff2) 这类静态资源漏网
-    static_re = re.compile(r"\.(png|jpe?g|gif|svg|webp|ico|css|js|otf|ttf|woff2?|eot)([?),]|$)", re.IGNORECASE)
-    assets_re = re.compile(r"^https://(?:assets|cdn)\.", re.IGNORECASE)
-    tracker_re = re.compile(r"^https://[^/]*(?:mail\.anthropic\.com|(?:email|mail|url\d*|t|links?|click)\.openai\.com)/", re.IGNORECASE)
-    login_kw = re.compile(r"(sign[-_]?in|magic|verify|auth|login|token|invite|onboard)", re.IGNORECASE)
-    # 去掉 URL 尾部可能带的标点（HTML 转义/排版残留）
-    matches = [u.rstrip(").,;'\"") for u in url_re.findall(body)]
-    candidates = [
-        u for u in matches
-        if not static_re.search(u) and not assets_re.match(u) and not tracker_re.match(u)
-    ]
-    if not candidates:
-        return ""
-    preferred = [u for u in candidates if login_kw.search(u)]
-    return preferred[0] if preferred else candidates[0]
 
 
 def _extract_chatgpt_code(body: str) -> str:
