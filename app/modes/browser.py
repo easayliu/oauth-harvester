@@ -444,7 +444,7 @@ def _imap_wait_new_magic_link(host: str, port: int, email_addr: str, app_passwor
             logger.warning(f"IMAP 登录/协议错误: {e}")
             return ""
         except Exception as e:
-            logger.debug(f"IMAP 轮询异常（继续重试）: {e}")
+            logger.warning(f"IMAP 轮询异常（继续重试）: {e}")
         time.sleep(poll_interval_s)
     logger.warning(f"等待超时，未抓到新的{what}邮件")
     return ""
@@ -708,7 +708,9 @@ async def _extract_oauth_code_from_page(page, pending_state: str) -> str | None:
         n = await inputs.count()
         for i in range(min(n, 6)):
             try:
-                val = (await inputs.nth(i).input_value()) or ""
+                # 必须给短超时：默认 30s，点完授权页面正在跳转时 nth(i) 已不存在，
+                # 会白等满 30s 才轮到下一轮检查回跳 URL
+                val = (await inputs.nth(i).input_value(timeout=500)) or ""
             except Exception:
                 continue
             if "#" in val and pending_state in val:
