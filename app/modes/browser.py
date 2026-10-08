@@ -1030,6 +1030,11 @@ async def _claude_extract_session_and_bind(page, context, email_addr, app_passwo
     return bool(session_key)
 
 
+# 自动提交邮箱后等登录邮件的超时 / 轮询间隔（秒）
+_AUTO_MAIL_WAIT_S = 120
+_AUTO_MAIL_POLL_S = 3
+
+
 async def _claude_email_magic_login(page, email_addr, app_password, imap_host, imap_port,
                                     *, delete_after=False, interactive=True,
                                     client_id="", refresh_token="",
@@ -1119,10 +1124,12 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
     await page.screenshot(path=_screenshot_path("email_submitted", email_addr))
 
     # 4. 后台 IMAP 轮询抓 magic link
-    logger.info("等待登录邮件（最长 5 分钟）...")
+    # 程序自动提交，邮件通常几十秒内就到；没到基本就是不会来了，不必空等太久
+    logger.info(f"等待登录邮件（最长 {_AUTO_MAIL_WAIT_S}s）...")
     magic_link = await asyncio.to_thread(
         _imap_wait_new_magic_link, imap_host, imap_port, email_addr, app_password,
-        baseline_uid, 300, 6, "anthropic", "link", delete_after, access_token,
+        baseline_uid, _AUTO_MAIL_WAIT_S, _AUTO_MAIL_POLL_S, "anthropic", "link",
+        delete_after, access_token,
     )
     if not magic_link:
         logger.warning("未抓到登录链接")
