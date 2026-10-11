@@ -48,11 +48,20 @@ try:
     from config import BROWSER_GEOIP
 except ImportError:
     BROWSER_GEOIP = True
+try:
+    from config import BROWSER_FIXED_FINGERPRINT
+except ImportError:
+    BROWSER_FIXED_FINGERPRINT = True
 
 try:
     from config import KIRO_BROWSER_BACKEND
 except ImportError:
     KIRO_BROWSER_BACKEND = "camoufox"
+
+try:
+    from config import CLAUDE_LOGIN_BACKEND
+except ImportError:
+    CLAUDE_LOGIN_BACKEND = "camoufox"
 
 # BotBrowser（patched Chromium，源码级指纹伪装）后端所需的两个外部资产：
 #   BOTBROWSER_EXEC_PATH    : 内核可执行文件（GitHub Releases 下载解压，

@@ -20,6 +20,7 @@ BROWSER_LOCALE   = "en-US"       # 语言/地区（en-US / ja / zh-CN / de-DE �
 BROWSER_TIMEZONE = ""            # 时区（Asia/Tokyo / America/New_York …）；留空=系统/geoip 自动
 BROWSER_OS       = "windows"     # Camoufox OS 指纹（windows / macos / linux）
 BROWSER_GEOIP    = True          # 按出口 IP 自动同步 timezone/locale/WebRTC（Camoufox 专用）
+BROWSER_FIXED_FINGERPRINT = True # Camoufox 按 profile 固定设备指纹（首次生成存进 profile，之后复用）
 
 # 后端选择（环境变量 KIRO_BROWSER_BACKEND 可临时覆盖）
 # camoufox : stealth Firefox（默认，过 Google "browser may not be secure" 最稳）
@@ -28,6 +29,11 @@ BROWSER_GEOIP    = True          # 按出口 IP 自动同步 timezone/locale/Web
 # safari   : 真 Safari via safaridriver
 # botbrowser: BotBrowser（patched Chromium，源码级指纹伪装）
 KIRO_BROWSER_BACKEND = "camoufox"
+
+# claude-email / claude-bind 登录内核（环境变量 CLAUDE_LOGIN_BACKEND 或 --backend 可临时覆盖）
+# camoufox   : stealth Firefox（默认）
+# patchright : Playwright stealth 补丁版 + 系统真 Chrome，Camoufox 登不进 Claude 时的备选
+CLAUDE_LOGIN_BACKEND = "camoufox"
 
 # BotBrowser 后端所需外部资产（仅 backend=botbrowser 时生效）
 BOTBROWSER_EXEC_PATH    = ""     # 内核路径，如 "/Applications/Chromium.app/Contents/MacOS/Chromium"

@@ -129,7 +129,12 @@ def print_help():
 
   chrome          启动真 Chrome（独立 profile，零自动化，供手动操作）
                   python main.py chrome 'a@b.com'
-                  --url https://kiro.dev
+                  --url https://kiro.dev  --locale=en-US --tz=America/New_York
+                  （claude-mail 同样生效；WebRTC 固定禁用非代理 UDP，不暴露真实 IP）
+
+  camoufox        打开 claude-email 同一份 Camoufox profile（已登录态，供手动操作）
+                  python main.py camoufox 'a@b.com'
+                  --url https://claude.ai/（默认）  --tz= --locale= --os= --geoip= --proxy=
 
   yahoo           Yahoo IMAP 读最新 Anthropic/OpenAI 邮件，提取登录链接
                   python main.py yahoo 'email----app_password'
@@ -183,14 +188,15 @@ def print_help():
 
 ═══════════════════════════════════════════════════════════════════
 
-通用浏览器参数（claude-mail / claude-email / chatgpt-mail / chrome 等）:
+通用浏览器参数（claude-mail / claude-email / chatgpt-mail / chrome / camoufox 等）:
   --tz=Asia/Tokyo        时区
   --locale=ja            语言/地区
   --os=macos             OS 指纹伪装（仅 Camoufox）
   --geoip=false          关闭 IP 自动同步 tz/locale（仅 Camoufox）
+  --backend=patchright   claude-email/claude-bind 登录内核切真 Chrome stealth（Camoufox 登不进 Claude 时用）；默认 camoufox
   --proxy=socks5://h:p   代理（覆盖 config PROXY，支持 socks5/socks5h/http；claude-mail / chatgpt-mail 不走代理）
   PROXY_POOL（config）   出口代理池（URL 列表或文件路径），claude-bind-session 按账号轮换、自动跳过不通的；--proxy 优先
-  也可在 config.py 全局配置: BROWSER_LOCALE / BROWSER_TIMEZONE / BROWSER_OS / BROWSER_GEOIP
+  也可在 config.py 全局配置: BROWSER_LOCALE / BROWSER_TIMEZONE / BROWSER_OS / BROWSER_GEOIP / CLAUDE_LOGIN_BACKEND
 
 说明:
   - 不传 mode 时默认 password 模式

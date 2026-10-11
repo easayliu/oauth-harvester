@@ -23,6 +23,7 @@ from app.settings import (
     HEADLESS,
     PROXY,
     KIRO_BROWSER_BACKEND,
+    CLAUDE_LOGIN_BACKEND,
     BOTBROWSER_EXEC_PATH,
     BOTBROWSER_PROFILE_PATH,
     KIRO_PROFILE_MAX_COUNT,
@@ -32,6 +33,7 @@ from app.settings import (
     BROWSER_TIMEZONE,
     BROWSER_OS,
     BROWSER_GEOIP,
+    BROWSER_FIXED_FINGERPRINT,
     PROXY_TEST_URL,
 )
 
@@ -267,6 +269,7 @@ KIRO_FIREFOX_PROFILE_ROOT = os.path.expanduser("~/.kiro-firefox-profiles")
 KIRO_WEBKIT_PROFILE_ROOT = os.path.expanduser("~/.kiro-webkit-profiles")
 KIRO_BOTBROWSER_PROFILE_ROOT = os.path.expanduser("~/.kiro-botbrowser-profiles")
 KIRO_REALCHROME_PROFILE_ROOT = os.path.expanduser("~/.kiro-realchrome-profiles")
+KIRO_PATCHRIGHT_PROFILE_ROOT = os.path.expanduser("~/.kiro-patchright-profiles")
 
 # AWS 系列（aws / aws-claude / aws-kiro）登录会话持久化目录：按 admin 邮箱存一份
 # storage_state（cookie + localStorage），下次跑同一账号直接复用、跳过 root 登录。
@@ -412,7 +415,8 @@ def get_kiro_profile_dir(email: str, browser: str = "chrome") -> str:
     root = {"firefox": KIRO_FIREFOX_PROFILE_ROOT,
             "webkit": KIRO_WEBKIT_PROFILE_ROOT,
             "botbrowser": KIRO_BOTBROWSER_PROFILE_ROOT,
-            "realchrome": KIRO_REALCHROME_PROFILE_ROOT}.get(browser, KIRO_PROFILE_ROOT)
+            "realchrome": KIRO_REALCHROME_PROFILE_ROOT,
+            "patchright": KIRO_PATCHRIGHT_PROFILE_ROOT}.get(browser, KIRO_PROFILE_ROOT)
     _enforce_kiro_profile_limits(root)
     path = os.path.join(root, safe)
     os.makedirs(path, exist_ok=True)
@@ -1125,6 +1129,66 @@ async def new_camoufox_context(browser, storage_state=None) -> BrowserContext:
         return await browser.new_context(**ctx_kwargs)
 
 
+# ============================================================
+# Camoufox 按 profile 固定设备指纹
+# ------------------------------------------------------------
+# Camoufox 默认每次启动都随机生成一套指纹（UA/屏幕/字体/WebGL/canvas·audio 噪声种子），
+# 同一账号的持久化 profile 每次打开都像换了台电脑，和「persistent profile 降风控」的初衷
+# 相悖。这里首次启动时生成一份设备指纹存进 profile，之后原样作为 config 传回去：
+#   · 只存设备相关项；时区/语言/地理位置/WebRTC 不存，每次仍按出口 IP 与 --tz/--locale 现算；
+#   · --os 与存档不一致视为要换设备，重新生成；
+#   · Camoufox 升级后 UA 里的 Firefox 版本跟着改成实际内核版本，避免 UA 与内核对不上。
+# ============================================================
+_CAMOUFOX_FP_FILE = "camoufox_fingerprint.json"
+
+
+def _camoufox_ff_major() -> str:
+    from camoufox.pkgman import installed_verstr
+    return installed_verstr().split(".", 1)[0]
+
+
+def _camoufox_profile_fingerprint(user_data_dir: str, os_name: str,
+                                  window: tuple[int, int], headless) -> dict:
+    """返回该 profile 固定的 Camoufox 设备指纹 config（没有或不适用则生成并落盘）。"""
+    path = os.path.join(user_data_dir, _CAMOUFOX_FP_FILE)
+    ff_major = _camoufox_ff_major()
+    try:
+        with open(path) as f:
+            saved = json.load(f)
+        if saved.get("os") == os_name and isinstance(saved.get("config"), dict):
+            config = saved["config"]
+            if saved.get("ff_version") != ff_major:
+                old = saved.get("ff_version")
+                ua = config.get("navigator.userAgent", "")
+                config["navigator.userAgent"] = re.sub(
+                    r"(rv:|Firefox/)\d+\.0", rf"\g<1>{ff_major}.0", ua)
+                saved["ff_version"] = ff_major
+                with open(path, "w") as f:
+                    json.dump(saved, f)
+                logger.info(f"Camoufox 内核版本 {old} → {ff_major}，已同步指纹 UA 版本号")
+            logger.info(f"复用 profile 固定指纹（os={os_name}）")
+            return config
+        logger.info(f"profile 指纹 os={saved.get('os')} 与本次 os={os_name} 不一致，重新生成")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"读取 profile 指纹失败，重新生成: {e}")
+
+    from camoufox.utils import launch_options
+    opts = launch_options(os=os_name, window=window, headless=bool(headless),
+                          i_know_what_im_doing=True)
+    env = opts["env"]
+    chunks = sorted((k for k in env if k.startswith("CAMOU_CONFIG_")),
+                    key=lambda k: int(k.rsplit("_", 1)[1]))
+    config = json.loads("".join(env[k] for k in chunks))
+    config.pop("addons", None)  # 本机插件路径，每次启动由 Camoufox 自己加
+    with open(path, "w") as f:
+        json.dump({"os": os_name, "ff_version": ff_major, "config": config}, f)
+    logger.info(f"已生成并保存 profile 固定指纹（os={os_name}, "
+                f"webgl={config.get('webGl:renderer', '?')[:60]}）")
+    return config
+
+
 async def launch_camoufox_persistent_context(user_data_dir: str, *,
                                              locale: str = None,
                                              timezone: str = None,
@@ -1175,6 +1239,13 @@ async def launch_camoufox_persistent_context(user_data_dir: str, *,
     )
     if eff_tz:
         camoufox_kwargs["env"] = {"TZ": eff_tz}
+    if BROWSER_FIXED_FINGERPRINT:
+        try:
+            camoufox_kwargs["config"] = await asyncio.get_event_loop().run_in_executor(
+                None, _camoufox_profile_fingerprint, user_data_dir, eff_os, (w, h), headless_val)
+            camoufox_kwargs["i_know_what_im_doing"] = True  # 手动 config 的告警
+        except Exception as e:
+            logger.warning(f"固定指纹不可用，本次随机生成: {e}")
     cm = AsyncCamoufox(**camoufox_kwargs)
     context = await cm.__aenter__()
     return context, cm
@@ -1189,6 +1260,134 @@ async def close_camoufox_persistent_context(cm) -> None:
         await cm.__aexit__(None, None, None)
     except Exception as e:
         logger.warning(f"关闭 Camoufox persistent context 失败（忽略）: {e}")
+
+
+# ============================================================
+# Patchright：Playwright 的 stealth 补丁版（Chromium 系）
+# ------------------------------------------------------------
+# 动机：Camoufox(Firefox) 对 claude.ai/Cloudflare 的过率不稳定（magic-link 验证页卡住、
+# Turnstile 拦）。Patchright 是 Playwright 的 drop-in 补丁版，源码级抹掉 Chromium 自动化
+# 痕迹（Runtime.enable 泄漏 / cdc_ 变量 / navigator.webdriver），配合系统真 Chrome
+# （channel="chrome"）+ 持久化 profile 过率更高。API 与 Playwright 完全一致。
+#
+# 关键（Patchright 官方反检测建议，勿改）：
+#   · 用真 Chrome channel，不用 Playwright 自带 Chromium；
+#   · no_viewport=True（视口随真实窗口，别注入固定 viewport）；
+#   · 不加 --disable-blink-features=AutomationControlled 等「反检测」flag——Patchright
+#     已在内核层处理，手动加反而是可被识别的痕迹。
+# ============================================================
+async def _launch_patchright_persistent_context(user_data_dir: str, *,
+                                                locale: str = None,
+                                                timezone: str = None,
+                                                headless: bool = None,
+                                                proxy: str = None):
+    """Patchright + 系统真 Chrome 持久化 context，返回 (context, pw)。
+    pw 由本函数 start，关闭时必须一并 pw.stop()。
+    locale/timezone/headless/proxy 语义与 launch_camoufox_persistent_context 对齐；
+    不传则取 config（timezone 另经进程 TZ 环境变量注入，与 camoufox 一致）。"""
+    from patchright.async_api import async_playwright
+    w, h = _camoufox_window_size()
+    proxy_cfg = await _proxy_settings_async(proxy)
+    # Chromium 的 headless 只认 bool（不像 Camoufox 有 "virtual" Xvfb 档）。
+    # "virtual"(Linux HEADLESS=True) 映射成 headful=False：在服务器的 Xvfb/真实显示下跑，
+    # 避开真 headless 的 "HeadlessChrome" UA 泄漏（Cloudflare 专抓 → 直接弹 challenge）。
+    _hv = _camoufox_headless_value(headless)
+    headless_val = False if _hv == "virtual" else bool(_hv)
+    if headless_val:
+        logger.warning("Patchright 真 headless 的 UA 带 HeadlessChrome，易触发 Cloudflare challenge；"
+                       "建议 --no-headless（或 Linux 下用 Xvfb headful）")
+    eff_locale = locale or BROWSER_LOCALE or "en-US"
+    eff_tz = timezone or BROWSER_TIMEZONE
+    # Patchright 下保持 args 极简：只定窗口，不碰自动化相关 flag
+    args = [f"--window-size={w},{h}", "--window-position=0,0"]
+    logger.info(
+        f"启动 Patchright stealth Chrome(channel=chrome) 持久化 context "
+        f"(profile={user_data_dir}, headless={headless_val}, window={w}x{h}, "
+        f"proxy={'yes' if proxy_cfg else 'no'}, locale={eff_locale}, tz={eff_tz or 'system'})"
+    )
+    pw = await async_playwright().start()
+    try:
+        context = await pw.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            channel="chrome",                              # 系统安装的正版 Chrome
+            headless=headless_val,
+            proxy=proxy_cfg,
+            args=args,
+            ignore_default_args=["--enable-automation"],   # 去掉自动化横幅/标记
+            no_viewport=True,
+            locale=eff_locale,
+            timezone_id=eff_tz or None,
+        )
+    except Exception:
+        await pw.stop()
+        raise
+    return context, pw
+
+
+async def _close_patchright_persistent_context(handle) -> None:
+    """关闭 _launch_patchright_persistent_context 返回的 (context, pw)。内部吞异常。"""
+    if not handle:
+        return
+    context, pw = handle
+    try:
+        await context.close()
+    except Exception as e:
+        logger.warning(f"关闭 Patchright persistent context 失败（忽略）: {e}")
+    try:
+        await pw.stop()
+    except Exception as e:
+        logger.warning(f"停止 Patchright playwright 失败（忽略）: {e}")
+
+
+# ============================================================
+# claude-email / claude-bind 登录浏览器统一入口
+# ------------------------------------------------------------
+# 按 backend 选内核，对调用方屏蔽「camoufox 返回 cm / patchright 返回 (context, pw)」
+# 的差异：统一返回 (context, handle)，handle 交给 close_claude_login_context() 清理。
+# 两内核 profile 不兼容（Firefox ↔ Chromium），按 backend 分流到不同 profile root。
+# ============================================================
+CLAUDE_LOGIN_BACKENDS = ("camoufox", "patchright")
+
+
+def claude_login_backend(override: str = None) -> str:
+    """claude-email/claude-bind 登录内核：'camoufox'(默认 Firefox) / 'patchright'(真 Chrome)。
+    优先级：显式 override（--backend）> 环境变量 CLAUDE_LOGIN_BACKEND > config > 'camoufox'。"""
+    raw = (override or os.getenv("CLAUDE_LOGIN_BACKEND")
+           or CLAUDE_LOGIN_BACKEND or "camoufox").strip().lower()
+    if raw in ("patchright", "chrome", "chromium", "real-chrome", "realchrome"):
+        return "patchright"
+    return "camoufox"
+
+
+async def launch_claude_login_context(email: str, *, backend: str = None,
+                                      locale: str = None, timezone: str = None,
+                                      os_name: str = None, geoip: bool = None,
+                                      headless: bool = None, proxy: str = None):
+    """按 backend 启动 claude 登录用持久化 context，返回 (context, profile_dir, handle)。
+    handle 交给 close_claude_login_context() 清理（吞异常）。
+    backend 不传则走 claude_login_backend()（环境变量 / 默认 camoufox）。"""
+    be = claude_login_backend(backend)
+    if be == "patchright":
+        profile_dir = get_kiro_profile_dir(email, browser="patchright")
+        context, pw = await _launch_patchright_persistent_context(
+            profile_dir, locale=locale, timezone=timezone, headless=headless, proxy=proxy)
+        return context, profile_dir, ("patchright", (context, pw))
+    profile_dir = get_kiro_profile_dir(email, browser="firefox")
+    context, cm = await launch_camoufox_persistent_context(
+        profile_dir, locale=locale, timezone=timezone, os_name=os_name,
+        geoip=geoip, headless=headless, proxy=proxy)
+    return context, profile_dir, ("camoufox", cm)
+
+
+async def close_claude_login_context(handle) -> None:
+    """关闭 launch_claude_login_context 返回的 handle。内部吞异常，调用方无需包裹。"""
+    if not handle:
+        return
+    kind, h = handle
+    if kind == "patchright":
+        await _close_patchright_persistent_context(h)
+        return
+    await close_camoufox_persistent_context(h)
 
 
 # ============================================================

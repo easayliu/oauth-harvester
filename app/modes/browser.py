@@ -11,6 +11,7 @@
 import asyncio
 import email as email_pkg
 import imaplib
+import json
 import logging
 import os
 import re
@@ -52,6 +53,8 @@ def _parse_browser_cli_overrides(extra_args: list[str] = None) -> dict:
             overrides["geoip"] = arg.split("=", 1)[1].lower() not in ("false", "0", "no", "off")
         elif arg.startswith("--proxy="):
             overrides["proxy"] = arg.split("=", 1)[1]
+        elif arg.startswith("--backend="):
+            overrides["backend"] = arg.split("=", 1)[1]
         elif arg == "--headless":
             overrides["headless"] = True
         elif arg == "--no-headless":
@@ -82,6 +85,88 @@ def _chrome_proxy_args(proxy_url: str) -> list[str]:
         logger.warning("Chrome subprocess 的 --proxy-server 不支持内联认证（user:pass@host），"
                        "认证代理需在 Chrome 弹窗中手动输入账密")
     return chrome_args
+
+
+def _accept_languages(locale: str) -> str:
+    """en-US → 'en-US,en'；ja → 'ja'（与真 Chrome 默认的 Accept-Language 列表形态一致）"""
+    base = locale.split("-", 1)[0]
+    return locale if base == locale else f"{locale},{base}"
+
+
+def _realchrome_env_args(profile_dir: str, overrides: dict) -> tuple[list[str], dict | None, str, str]:
+    """真 Chrome（subprocess）的语言 / 时区 / WebRTC 设置，chrome 与 claude-mail 共用。
+
+    实测（macOS Chrome 154）各项要这样配才全部一致：
+      · 语言：--lang 在 macOS 上被忽略；-AppleLanguages 决定 UI/Intl 语言，但已有 profile
+        的 Accept-Language / navigator.languages 存在 Preferences，
+        只认它（新版 Chrome 为 intl.selected_languages）—— 所以两处都设。
+      · 时区：进程环境变量 TZ（Date / Intl / Worker 全部生效）。
+      · WebRTC：Preferences 的 webrtc.ip_handling_policy=disable_non_proxied_udp，
+        不出任何 ICE 候选（不暴露本机/真实出口 IP），走代理时仍可经代理 TCP 使用。
+    Preferences 必须在该 profile 的 Chrome 未运行时写，否则会被正在运行的实例覆盖。
+    返回 (Chrome 参数, env, locale, tz)。
+    """
+    locale = overrides.get("locale") or BROWSER_LOCALE
+    tz = overrides.get("timezone") or BROWSER_TIMEZONE
+
+    args = ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
+    if locale:
+        args.append(f"--lang={locale}")
+        if sys.platform == "darwin":
+            # Chrome 会把 "(en-US)" 当成网址多开一个错误页，所以带 --no-startup-window
+            # 起空进程，再由 _launch_realchrome 把真正的 URL 转发进去
+            args += ["--no-startup-window", "-AppleLanguages", f"({locale})"]
+    env = {**os.environ, "TZ": tz} if tz else None
+
+    if _chrome_profile_running(profile_dir):
+        logger.warning("该 profile 的 Chrome 已在运行，语言/WebRTC 设置本次不生效（关掉后重开）")
+        return args, env, locale, tz
+    prefs_path = os.path.join(profile_dir, "Default", "Preferences")
+    try:
+        with open(prefs_path) as f:
+            prefs = json.load(f)
+    except FileNotFoundError:
+        prefs = {}
+    except Exception as e:
+        logger.warning(f"读取 Chrome Preferences 失败，语言/WebRTC 设置跳过: {e}")
+        return args, env, locale, tz
+    if locale:
+        # Chrome 新版读 selected_languages；accept_languages 是旧键，只在首次启动迁移，两个都写
+        langs = _accept_languages(locale)
+        prefs.setdefault("intl", {}).update({"selected_languages": langs, "accept_languages": langs})
+    prefs.setdefault("webrtc", {}).update({
+        "ip_handling_policy": "disable_non_proxied_udp",
+        "multiple_routes_enabled": False,
+        "nonproxied_udp_enabled": False,
+    })
+    os.makedirs(os.path.dirname(prefs_path), exist_ok=True)
+    with open(prefs_path, "w") as f:
+        json.dump(prefs, f)
+    return args, env, locale, tz
+
+
+def _launch_realchrome(profile_dir: str, args: list[str], url: str, env: dict | None):
+    """启动真 Chrome 并打开 url，返回主进程 Popen。
+
+    带 --no-startup-window（macOS 设语言时）则先起无窗口进程，等单实例锁就绪后再用
+    同 profile 调一次 Chrome 把 url 转发进去（零自动化，同 _open_url_in_profile）。"""
+    if "--no-startup-window" not in args:
+        return subprocess.Popen([*args, url], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env)
+    lock = os.path.join(profile_dir, "SingletonLock")
+    if not _chrome_profile_running(profile_dir):
+        for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            try:
+                os.remove(os.path.join(profile_dir, name))  # 上次异常退出残留的锁
+            except FileNotFoundError:
+                pass
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    deadline = time.time() + 15
+    while not os.path.lexists(lock) and proc.poll() is None and time.time() < deadline:
+        time.sleep(0.2)
+    time.sleep(0.5)
+    _open_url_in_profile(profile_dir, url)
+    return proc
 
 # IMAP 收件默认端口（IMAP4_SSL）
 _IMAP_DEFAULT_PORT = 993
@@ -254,25 +339,18 @@ async def run_chrome(mode: str, raw_input: str, is_file: bool):
         "--no-first-run",
         "--no-default-browser-check",
     ]
-    chrome_locale = overrides.get("locale") or BROWSER_LOCALE
-    if chrome_locale:
-        args.append(f"--lang={chrome_locale}")
+    env_args, chrome_env, chrome_locale, chrome_tz = _realchrome_env_args(profile_dir, overrides)
+    args.extend(env_args)
     chrome_proxy = overrides.get("proxy") or PROXY
     args.extend(_chrome_proxy_args(chrome_proxy))
-    args.append(url or "about:blank")
-
-    chrome_env = None
-    chrome_tz = overrides.get("timezone") or BROWSER_TIMEZONE
-    if chrome_tz:
-        chrome_env = {**os.environ, "TZ": chrome_tz}
 
     logger.info(f"subprocess 启动真 Chrome（无任何自动化痕迹）profile={profile_dir}"
                 f"{f' lang={chrome_locale}' if chrome_locale else ''}"
-                f"{f' tz={chrome_tz}' if chrome_tz else ''}"
+                f"{f' tz={chrome_tz}' if chrome_tz else ''} webrtc=禁非代理UDP"
                 f"{f' proxy={chrome_proxy}' if chrome_proxy else ''}")
     logger.info("手动操作浏览器即可；关闭浏览器窗口或 Ctrl+C 退出（登录态保留在 profile 里）")
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            env=chrome_env)
+    proc = await asyncio.to_thread(
+        _launch_realchrome, profile_dir, args, url or "about:blank", chrome_env)
     try:
         await asyncio.to_thread(proc.wait)
         logger.info("浏览器已关闭")
@@ -282,6 +360,71 @@ async def run_chrome(mode: str, raw_input: str, is_file: bool):
             proc.terminate()
         except Exception:
             pass
+
+
+async def run_camoufox(mode: str, raw_input: str, is_file: bool):
+    """单独打开某个 email 的 Camoufox profile，供手动操作/排查登录态。
+
+    与 chrome 模式对应，但打开的是 claude-email / claude-bind / claude-bind-session
+    用的那份 Firefox profile（~/.kiro-firefox-profiles/<email>），启动参数也与之一致
+    （locale / tz / os / geoip / proxy），所以那边登录过的账号这里直接是登录态。
+    只打开页面、不做任何自动化动作；关闭浏览器窗口或 Ctrl+C 退出。
+    """
+    if is_file:
+        print("camoufox 模式只接受单个 email/profile 名，不支持文件")
+        exit(1)
+    # 允许直接粘贴整行账号（email----pwd / email:pwd / 两行 IMAP 格式），取其中的 email；
+    # 没有 email 时按 chrome 模式取第一段当 profile 名
+    m = re.search(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", raw_input)
+    email = m.group(0) if m else re.split(r"----|[,\s]", raw_input.strip())[0].strip()
+    if not email:
+        print("camoufox 模式需要一个 email/profile 名，例如: python main.py camoufox 'a@b.com'")
+        exit(1)
+
+    extra = sys.argv[3:]
+    url = "https://claude.ai/"
+    if "--url" in extra:
+        i = extra.index("--url")
+        if i + 1 >= len(extra):
+            print("--url 需要一个地址参数")
+            exit(1)
+        url = extra[i + 1]
+
+    from app.core.browser import (
+        launch_camoufox_persistent_context,
+        close_camoufox_persistent_context,
+    )
+
+    overrides = _parse_browser_cli_overrides(extra)
+    profile_dir = get_kiro_profile_dir(email, browser="firefox")
+    # 手动操作场景，忽略 --headless / config 的无头设置
+    context, cm = await launch_camoufox_persistent_context(
+        profile_dir,
+        locale=overrides.get("locale"),
+        timezone=overrides.get("timezone"),
+        os_name=overrides.get("os_name"),
+        geoip=overrides.get("geoip"),
+        headless=False,
+        proxy=overrides.get("proxy"),
+    )
+    try:
+        closed = asyncio.Event()
+        context.on("close", lambda *_: closed.set())
+        page = context.pages[0] if context.pages else await context.new_page()
+        if url != "about:blank":
+            try:
+                await page.goto(url, wait_until="commit", timeout=60000)
+            except Exception as e:
+                logger.warning(f"打开 {url} 失败（可在浏览器里手动打开）: {e}")
+        logger.info("手动操作浏览器即可；关闭浏览器窗口或 Ctrl+C 退出（登录态保留在 profile 里）")
+        # 关掉所有窗口/tab 后 context 不一定触发 close，所以同时看 pages 是否清空
+        while not closed.is_set() and context.pages:
+            await asyncio.sleep(1)
+        logger.info("浏览器已关闭")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("收到中断，正在关闭 Camoufox…")
+    finally:
+        await close_camoufox_persistent_context(cm)
 
 
 # ============================================================
@@ -597,25 +740,18 @@ async def run_claude_mail(mode: str, raw_input: str, is_file: bool):
         "--no-first-run",
         "--no-default-browser-check",
     ]
-    chrome_locale = overrides.get("locale") or BROWSER_LOCALE
-    if chrome_locale:
-        args.append(f"--lang={chrome_locale}")
+    env_args, chrome_env, chrome_locale, chrome_tz = _realchrome_env_args(profile_dir, overrides)
+    args.extend(env_args)
     # 本模式不走代理（config PROXY / --proxy 都忽略）：subprocess 真 Chrome 的
     # --proxy-server 不支持认证代理，带上反而报错、影响使用，直接用本机网络
     if overrides.get("proxy"):
         logger.info(f"{mode} 不支持代理，已忽略 --proxy")
-    args.append(flavor["login_url"])
-
-    chrome_env = None
-    chrome_tz = overrides.get("timezone") or BROWSER_TIMEZONE
-    if chrome_tz:
-        chrome_env = {**os.environ, "TZ": chrome_tz}
 
     logger.info(f"subprocess 启动真 Chrome（无任何自动化痕迹）profile={profile_dir}"
                 f"{f' lang={chrome_locale}' if chrome_locale else ''}"
-                f"{f' tz={chrome_tz}' if chrome_tz else ''}")
-    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     env=chrome_env)
+                f"{f' tz={chrome_tz}' if chrome_tz else ''} webrtc=禁非代理UDP")
+    await asyncio.to_thread(
+        _launch_realchrome, profile_dir, args, flavor["login_url"], chrome_env)
 
     # 邮箱放进剪贴板，提示手动粘贴提交（真人操作，最不易触发 Cloudflare 校验）
     copied = _copy_to_clipboard(email_addr)
@@ -1366,17 +1502,20 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
     logger.info(f"IMAP 收件服务器: {imap_host}:{imap_port}（{email_addr}）")
 
     from app.core.browser import (
-        get_kiro_profile_dir,
-        launch_camoufox_persistent_context,
-        close_camoufox_persistent_context,
+        launch_claude_login_context,
+        close_claude_login_context,
+        claude_login_backend,
         screenshot_path as _screenshot_path,
     )
     # 登录步骤与基准 UID 已下沉到 _claude_email_magic_login，这里不再预抓 UID
 
-    # 用持久化 context（按邮箱账号隔离 profile），cookie 跨 tab/跨次复用
-    profile_dir = get_kiro_profile_dir(email_addr, browser="firefox")
-    context, cm = await launch_camoufox_persistent_context(
-        profile_dir,
+    # 用持久化 context（按邮箱账号隔离 profile），cookie 跨 tab/跨次复用。
+    # backend 可切：默认 camoufox(Firefox)，--backend patchright 走真 Chrome stealth。
+    _backend = claude_login_backend(overrides.get("backend"))
+    logger.info(f"claude 登录内核: {_backend}")
+    context, profile_dir, _login_handle = await launch_claude_login_context(
+        email_addr,
+        backend=overrides.get("backend"),
         locale=overrides.get("locale"),
         timezone=overrides.get("timezone"),
         os_name=overrides.get("os_name"),
@@ -1445,7 +1584,7 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
             except (EOFError, KeyboardInterrupt):
                 pass
     finally:
-        await close_camoufox_persistent_context(cm)
+        await close_claude_login_context(_login_handle)
     return success
 
 

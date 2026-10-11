@@ -2,4 +2,5 @@ cloakbrowser
 camoufox[geoip]>=0.5.4  # 需 Python >=3.10
 pexpect>=4.9.0
 playwright==1.58.0
+patchright  # Playwright stealth 补丁版（claude-email --backend patchright，用系统真 Chrome）
 boto3>=1.34.0
