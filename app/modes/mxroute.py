@@ -6,8 +6,10 @@
   python main.py email add  accounts.txt            # 批量，每行 email----password
   python main.py email add  --random 10 --domain domain.com --out new.txt  # 随机生成 10 个
   python main.py email del  user@domain.com
+  python main.py email del  a@domain.com,b@domain.com  # 批量，逗号或空格分隔
   python main.py email del  accounts.txt            # 批量，每行 email（或 email----...）
   python main.py email list [domain.com]
+  python main.py email list [domain.com] --comma   # 只输出逗号拼接的邮箱，可直接给 del 用
   python main.py email inbox user@domain.com----Password123 [--count N] [--search 'FROM anthropic'] [--keep]
 
 未显式给域名时，取 --domain，再退回 config.MXROUTE_DEFAULT_DOMAIN。
@@ -278,7 +280,9 @@ async def _run_del(extra, resolve_domain):
             if email:
                 emails.append(email)
     else:
-        emails = [x for x in extra if not x.startswith("--")]
+        # 支持空格分隔多个参数，也支持单个参数里用逗号拼接
+        emails = [e.strip() for x in extra if not x.startswith("--")
+                  for e in x.split(",") if e.strip()]
 
     if not emails:
         print("del 需要 email。例：python main.py email del user@domain.com")
@@ -302,6 +306,10 @@ async def _run_del(extra, resolve_domain):
 
 
 async def _run_list(extra, resolve_domain):
+    # --comma：只输出逗号拼接的邮箱，可直接喂给 email del
+    comma = "--comma" in extra
+    if comma:
+        extra.remove("--comma")
     explicit = ""
     if extra and not extra[0].startswith("--"):
         explicit = extra[0]
@@ -312,6 +320,9 @@ async def _run_list(extra, resolve_domain):
     accounts = list_email_accounts(domain)
     if not accounts:
         print(f"{domain} 下没有邮箱账号。")
+        return
+    if comma:
+        print(",".join(a.get("email") or f"{a.get('username', '')}@{domain}" for a in accounts))
         return
     print(f"{domain} 共 {len(accounts)} 个邮箱账号：")
     for a in accounts:

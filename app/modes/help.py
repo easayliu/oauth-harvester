@@ -64,6 +64,8 @@ def print_help():
 
   claude-email    Camoufox 自动化登录 Claude（自动填邮箱、抓链接、推引导、提取 sessionKey）
                   python main.py claude-email 'email----app_password'
+                  Outlook 个人号（已关密码 IMAP）用完整卡密，自动走 XOAUTH2 取件：
+                    email----密码----ClientId----refresh_token----辅助邮箱----辅助密码----sk
                   批量：传文件路径即逐个处理 → python main.py claude-email accounts.txt
 
   claude-bind     同 claude-email，登录成功后再自动走 OAuth 授权，把账号加入 oauth-accounts 后台
@@ -73,8 +75,11 @@ def print_help():
                   后台地址/鉴权复用 OAUTH_ADMIN_API_*，exchange 入参见 OAUTH_BIND_*（config.py）
                   可临时用 --admin-token=<access_token> 覆盖后台 token
                   后端可切换（config: OAUTH_BIND_BACKEND）：
-                    default = oauth-accounts 后台； luban = luban 服务（LUBAN_BASE_URL + LUBAN_ADMIN_PASSWORD）
-                    luban 出站代理：LUBAN_BIND_PROXY 填 URL，或 LUBAN_BIND_PROXY_ID 只填代理池 id
+                    default = oauth-accounts 后台； luban = luban 服务（LUBAN_BASE_URL）
+                    luban 鉴权：LUBAN_PROVISION_KEY 上号 Key（推荐），或 LUBAN_USERNAME + LUBAN_ADMIN_PASSWORD 登录
+                    luban 出站代理：LUBAN_BIND_PROXY 填 URL，或 LUBAN_BIND_PROXY_ID 只填代理池 id；
+                      都不填时上号 Key 由 luban 从代理池自动分配
+                    luban 分组：LUBAN_BIND_GROUP_IDS 或 LUBAN_BIND_GROUP_NAMES，留空进默认分组
                   批量文件两种布局：
                     A) 首行 IMAP 服务器，其后每行 email:password（同邮箱域共享服务器，推荐）
                          glacier.mxrouting.net:993
@@ -194,6 +199,7 @@ def print_help():
   --os=macos             OS 指纹伪装（仅 Camoufox）
   --geoip=false          关闭 IP 自动同步 tz/locale（仅 Camoufox）
   --backend=patchright   claude-email/claude-bind 登录内核切真 Chrome stealth（Camoufox 登不进 Claude 时用）；默认 camoufox
+  --backend=seleniumbase 登录内核切 SeleniumBase UC 模式真 Chrome（过 Cloudflare 首屏/自动点 Turnstile，之后 Patchright 接管）；需 headful
   --proxy=socks5://h:p   代理（覆盖 config PROXY，支持 socks5/socks5h/http；claude-mail / chatgpt-mail 不走代理）
   PROXY_POOL（config）   出口代理池（URL 列表或文件路径），claude-bind-session 按账号轮换、自动跳过不通的；--proxy 优先
   也可在 config.py 全局配置: BROWSER_LOCALE / BROWSER_TIMEZONE / BROWSER_OS / BROWSER_GEOIP / CLAUDE_LOGIN_BACKEND

@@ -3,4 +3,6 @@ camoufox[geoip]>=0.5.4  # 需 Python >=3.10
 pexpect>=4.9.0
 playwright==1.58.0
 patchright  # Playwright stealth 补丁版（claude-email --backend patchright，用系统真 Chrome）
+seleniumbase  # UC 模式 undetected Chrome（claude-email --backend seleniumbase，过 Cloudflare 首屏后交 Patchright 接管）
+pyautogui  # SeleniumBase uc_gui_click_captcha 用系统鼠标点 Turnstile
 boto3>=1.34.0

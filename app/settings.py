@@ -483,7 +483,8 @@ except ImportError:
 
 # claude-bind 的后端类型：
 #   "default" → oauth-accounts 后台（OAUTH_ADMIN_API_* / OAUTH_BIND_*）
-#   "luban"   → luban 服务（LUBAN_BASE_URL + LUBAN_ADMIN_PASSWORD，走 /api/authorize + /api/exchange）
+#   "luban"   → luban 服务（LUBAN_BASE_URL，走 /api/authorize + /api/exchange）
+#               鉴权：LUBAN_PROVISION_KEY（上号 Key，推荐）或 LUBAN_USERNAME + LUBAN_ADMIN_PASSWORD 登录
 try:
     from config import OAUTH_BIND_BACKEND
 except ImportError:
@@ -496,6 +497,16 @@ try:
     from config import LUBAN_ADMIN_PASSWORD
 except ImportError:
     LUBAN_ADMIN_PASSWORD = ""
+# luban 控制台用户名（与 LUBAN_ADMIN_PASSWORD 一起登录换会话 token）
+try:
+    from config import LUBAN_USERNAME
+except ImportError:
+    LUBAN_USERNAME = "admin"
+# luban 上号 Key（lbp-…）：填了就直接当 Bearer，不再用用户名密码登录
+try:
+    from config import LUBAN_PROVISION_KEY
+except ImportError:
+    LUBAN_PROVISION_KEY = ""
 # exchange 时可选带的显示名 / 出站代理（留空则 luban 自动命名 / 直连）
 try:
     from config import LUBAN_BIND_LABEL
@@ -505,8 +516,17 @@ try:
     from config import LUBAN_BIND_PROXY
 except ImportError:
     LUBAN_BIND_PROXY = None
-# 只填代理池 id 也行：绑定前用 GET /api/proxies 解析成 URL 再传；LUBAN_BIND_PROXY 非空时以 URL 为准
+# 或只填本人代理池 id，exchange 直接传 proxy_id；LUBAN_BIND_PROXY 非空时以 URL 为准
 try:
     from config import LUBAN_BIND_PROXY_ID
 except ImportError:
     LUBAN_BIND_PROXY_ID = None
+# 号池分组：填 id 列表，或填分组名（GET /api/groups 解析）；都留空进默认分组
+try:
+    from config import LUBAN_BIND_GROUP_IDS
+except ImportError:
+    LUBAN_BIND_GROUP_IDS = []
+try:
+    from config import LUBAN_BIND_GROUP_NAMES
+except ImportError:
+    LUBAN_BIND_GROUP_NAMES = []

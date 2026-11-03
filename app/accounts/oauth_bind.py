@@ -10,6 +10,7 @@
 
 import json
 import logging
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,6 +36,10 @@ from app.settings import (
     LUBAN_BIND_LABEL,
     LUBAN_BIND_PROXY,
     LUBAN_BIND_PROXY_ID,
+    LUBAN_BIND_GROUP_IDS,
+    LUBAN_BIND_GROUP_NAMES,
+    LUBAN_PROVISION_KEY,
+    LUBAN_USERNAME,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,13 +50,13 @@ EXCHANGE_PATH = "/api/admin/oauth-accounts/exchange"
 GROUPS_PATH = "/api/admin/groups"
 ACCOUNT_POLICY_TEMPLATES_PATH = "/api/admin/account-policy-templates"
 
-# luban 后端的接口路径（鉴权为 Authorization: Bearer <管理员密码>）
+# luban 后端的接口路径（鉴权见下方 luban 小节）
+LUBAN_LOGIN_PATH = "/api/auth/login"
 LUBAN_AUTHORIZE_PATH = "/api/authorize"
 LUBAN_EXCHANGE_PATH = "/api/exchange"
-LUBAN_PROXIES_PATH = "/api/proxies"
-
-# LUBAN_BIND_PROXY_ID 解析出的代理 URL，进程内只查一次
-_luban_proxy_url_cache: dict = {}
+LUBAN_GROUPS_PATH = "/api/groups"
+# luban 上号 Key 的前缀（store::PROVISION_KEY_PREFIX）
+LUBAN_PROVISION_KEY_PREFIX = "lbp-"
 
 
 def _state_from_url(url: str) -> str:
@@ -110,8 +115,16 @@ def _auth_headers(token: str) -> dict:
     return headers
 
 
+class RequestError(RuntimeError):
+    """admin API 返回非 2xx；status 供调用方区分 401 等。"""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 def _request(base_url: str, path: str, token: str, refresh_token: str = "",
-             method: str = "GET", body: dict = None) -> tuple:
+             method: str = "GET", body: dict = None, timeout: float = 30) -> tuple:
     """向 admin API 发请求，返回 (parsed_json, raw_text)。401 且有 refresh_token 时自动刷新重试一次。"""
     url = f"{base_url}{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else (b"" if method == "POST" else None)
@@ -120,7 +133,7 @@ def _request(base_url: str, path: str, token: str, refresh_token: str = "",
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             text = resp.read().decode("utf-8", errors="replace")
             return (json.loads(text) if text.strip() else {}), text
     except urllib.error.HTTPError as e:
@@ -129,8 +142,8 @@ def _request(base_url: str, path: str, token: str, refresh_token: str = "",
         if status == 401 and refresh_token:
             new_token = _refresh_access_token(base_url, refresh_token)
             if new_token:
-                return _request(base_url, path, new_token, "", method, body)
-        raise RuntimeError(f"请求失败 [{status}] {path}: {err_text[:500]}")
+                return _request(base_url, path, new_token, "", method, body, timeout)
+        raise RequestError(status, f"请求失败 [{status}] {path}: {err_text[:500]}")
 
 
 def get_access_token(base_url: str = None, token: str = None, refresh_token: str = None) -> str:
@@ -155,7 +168,7 @@ def get_auth_url(*args, backend: str = None, **kwargs) -> tuple:
     """
     backend = backend or OAUTH_BIND_BACKEND
     if backend == "luban":
-        return _get_auth_url_luban()
+        return _get_auth_url_luban(token=kwargs.get("token"))
     return _get_auth_url_default(*args, **kwargs)
 
 
@@ -163,18 +176,129 @@ def exchange(code: str, pending_state: str, *args, backend: str = None, **kwargs
     """按后端类型分发：用 code 换取并落库，返回解析后的 JSON。"""
     backend = backend or OAUTH_BIND_BACKEND
     if backend == "luban":
-        return _exchange_luban(code)
+        return _exchange_luban(code, token=kwargs.get("token"))
     return _exchange_default(code, pending_state, *args, **kwargs)
 
 
-# ---------- luban 后端：GET /api/authorize + POST /api/exchange，Bearer <管理员密码> ----------
+# ---------- luban 后端：GET /api/authorize + POST /api/exchange ----------
+#
+# luban 控制台已改成「用户名 + 密码登录换会话 token」，管理员密码不能再直接当 Bearer。
+# Bearer 按优先级取：
+#   1. 命令行 --admin-token= 传入的（上号 Key 或会话 token）
+#   2. LUBAN_PROVISION_KEY：上号 Key（lbp-…，网页账号菜单「上号 Key」里建）。只能取授权链接、
+#      交授权码、列分组与代理池，泄露了也只能往这个人名下添号；不指定代理时 luban 从本人代理池
+#      按挂号从少到多自动挑一条测通的（池空才直连）
+#   3. LUBAN_USERNAME + LUBAN_ADMIN_PASSWORD：POST /api/auth/login 换会话 token，进程内缓存，
+#      401（改过密码 / 会话过期）时重登一次
+# 授权链接按发起人隔离：authorize 与 exchange 必须是同一个人（同一把 Key 或同一用户）。
 
-def _get_auth_url_luban() -> tuple:
-    """luban：GET /api/authorize（Bearer 管理员密码）→ {url}；pending_state 从 url 的 state 取。"""
-    if not LUBAN_ADMIN_PASSWORD:
-        raise RuntimeError("未配置 LUBAN_ADMIN_PASSWORD（luban 网页『接入设置』里设的管理员密码）")
-    base_url = LUBAN_BASE_URL.rstrip("/")
-    data, raw = _request(base_url, LUBAN_AUTHORIZE_PATH, LUBAN_ADMIN_PASSWORD, "", method="GET")
+_luban_session: dict = {"token": None}
+_luban_session_lock = threading.Lock()
+# LUBAN_BIND_GROUP_NAMES 解析出的分组 id，进程内只查一次
+_luban_group_ids_cache: list | None = None
+
+
+def _luban_base_url() -> str:
+    return LUBAN_BASE_URL.rstrip("/")
+
+
+def _luban_static_token(token: str = None) -> str | None:
+    """不用登录就能直接当 Bearer 的：命令行 token > LUBAN_PROVISION_KEY；
+    LUBAN_ADMIN_PASSWORD 里填的若是上号 Key（lbp- 开头）也认。"""
+    for t in (token, LUBAN_PROVISION_KEY):
+        if t and t.strip():
+            return t.strip()
+    pw = (LUBAN_ADMIN_PASSWORD or "").strip()
+    if pw.startswith(LUBAN_PROVISION_KEY_PREFIX):
+        return pw
+    return None
+
+
+def _luban_login(stale: str = None) -> str:
+    """用户名 + 密码换会话 token。stale 是刚被 401 的那个：缓存仍是它才重登，
+    否则说明别的线程已经重登过，直接用新的。"""
+    with _luban_session_lock:
+        cur = _luban_session["token"]
+        if cur and cur != stale:
+            return cur
+        if not LUBAN_ADMIN_PASSWORD:
+            raise RuntimeError("未配置 luban 鉴权：填 LUBAN_PROVISION_KEY（上号 Key，推荐），"
+                               "或 LUBAN_USERNAME + LUBAN_ADMIN_PASSWORD")
+        username = LUBAN_USERNAME or "admin"
+        try:
+            data, raw = _request(_luban_base_url(), LUBAN_LOGIN_PATH, "", method="POST",
+                                 body={"username": username, "password": LUBAN_ADMIN_PASSWORD})
+        except RequestError as e:
+            raise RuntimeError(f"luban 登录失败（用户名 {username}）: {e}") from e
+        tok = data.get("token") if isinstance(data, dict) else None
+        if not tok:
+            raise RuntimeError(f"luban 登录响应缺少 token: {raw[:300]}")
+        logger.info(f"luban 已登录: {data.get('username') or username} ({data.get('role')})")
+        _luban_session["token"] = tok
+        return tok
+
+
+def _luban_request(path: str, method: str = "GET", body: dict = None,
+                   token: str = None, timeout: float = 30) -> tuple:
+    """带 luban 鉴权发请求；走会话 token 时 401 自动重登重试一次。"""
+    base_url = _luban_base_url()
+    static = _luban_static_token(token)
+    if static:
+        return _request(base_url, path, static, "", method, body, timeout)
+    tok = _luban_login()
+    try:
+        return _request(base_url, path, tok, "", method, body, timeout)
+    except RequestError as e:
+        if e.status != 401:
+            raise
+        logger.info("luban 会话失效，重新登录后重试")
+        return _request(base_url, path, _luban_login(stale=tok), "", method, body, timeout)
+
+
+def _luban_proxy_id() -> int | None:
+    if LUBAN_BIND_PROXY_ID in (None, ""):
+        return None
+    try:
+        return int(LUBAN_BIND_PROXY_ID)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"LUBAN_BIND_PROXY_ID 不是整数: {LUBAN_BIND_PROXY_ID!r}")
+
+
+def _luban_group_ids(token: str = None) -> list:
+    """exchange 的 group_ids：LUBAN_BIND_GROUP_IDS 直接用；否则按 LUBAN_BIND_GROUP_NAMES
+    查 GET /api/groups 解析；都没填返回 []（luban 放进默认分组）。"""
+    global _luban_group_ids_cache
+    if LUBAN_BIND_GROUP_IDS:
+        try:
+            return [int(g) for g in LUBAN_BIND_GROUP_IDS]
+        except (TypeError, ValueError):
+            raise RuntimeError(f"LUBAN_BIND_GROUP_IDS 必须是整数列表: {LUBAN_BIND_GROUP_IDS!r}")
+    names = [n.strip() for n in (LUBAN_BIND_GROUP_NAMES or []) if n and n.strip()]
+    if not names:
+        return []
+    if _luban_group_ids_cache is not None:
+        return _luban_group_ids_cache
+    data, raw = _luban_request(LUBAN_GROUPS_PATH, token=token)
+    if not isinstance(data, list):
+        raise RuntimeError(f"luban /api/groups 响应无法解析: {raw[:500]}")
+    by_name = {g.get("name"): g.get("id") for g in data if isinstance(g, dict)}
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        available = ", ".join(f"{g.get('id')}={g.get('name')}" for g in data if isinstance(g, dict)) or "（无可选分组）"
+        raise RuntimeError(f"luban 分组里没有 {missing}；可选: {available}")
+    _luban_group_ids_cache = [by_name[n] for n in names]
+    logger.info(f"luban 分组 {names} → id {_luban_group_ids_cache}")
+    return _luban_group_ids_cache
+
+
+def _get_auth_url_luban(token: str = None) -> tuple:
+    """luban：GET /api/authorize → {url}；pending_state 从 url 的 state 取。
+
+    分组名 / 代理 id 在这里先校验：配错了在开浏览器授权之前就报，不白跑一趟授权。
+    """
+    _luban_proxy_id()
+    _luban_group_ids(token)
+    data, raw = _luban_request(LUBAN_AUTHORIZE_PATH, token=token)
     auth_url = data.get("url") if isinstance(data, dict) else None
     if not auth_url:
         raise RuntimeError(f"luban authorize 响应缺少 url: {raw[:500]}")
@@ -184,51 +308,28 @@ def _get_auth_url_luban() -> tuple:
     return auth_url, pending_state
 
 
-def _exchange_luban(code: str) -> dict:
-    """luban：POST /api/exchange（Bearer 管理员密码），body {code, label?, proxy?}。
+def _exchange_luban(code: str, token: str = None) -> dict:
+    """luban：POST /api/exchange，body {code, label?, proxy? | proxy_id?, group_ids?}。
 
-    proxy 取 LUBAN_BIND_PROXY；为空时用 LUBAN_BIND_PROXY_ID 从代理池解析出 URL
-    （exchange 只认 URL，luban 按 URL 把账号关联回代理池那一条）。
-
-    luban 的 exchange 从 code 自己解析 state，不需要单独传 pending_state；
-    group/template/限额由 luban 用 /credentials 单独管理，此处不带。
+    proxy 与 proxy_id 二选一：LUBAN_BIND_PROXY（URL）优先，否则 LUBAN_BIND_PROXY_ID
+    （本人代理池里的 id，别人的 luban 回 404）；都不填时上号 Key 由 luban 自动分配、
+    会话 token 直连。luban 从 code 自己解析 state，不需要单独传 pending_state。
     """
-    if not LUBAN_ADMIN_PASSWORD:
-        raise RuntimeError("未配置 LUBAN_ADMIN_PASSWORD")
-    base_url = LUBAN_BASE_URL.rstrip("/")
     payload = {"code": code}
     if LUBAN_BIND_LABEL:
         payload["label"] = LUBAN_BIND_LABEL
-    proxy = LUBAN_BIND_PROXY or _luban_proxy_url_by_id(base_url, LUBAN_BIND_PROXY_ID)
-    if proxy:
-        payload["proxy"] = proxy
-    data, raw = _request(base_url, LUBAN_EXCHANGE_PATH, LUBAN_ADMIN_PASSWORD, "", method="POST", body=payload)
+    proxy_id = _luban_proxy_id()
+    if LUBAN_BIND_PROXY:
+        payload["proxy"] = LUBAN_BIND_PROXY
+    elif proxy_id is not None:
+        payload["proxy_id"] = proxy_id
+    group_ids = _luban_group_ids(token)
+    if group_ids:
+        payload["group_ids"] = group_ids
+    # 自动分配代理时 luban 会逐条测通（最多 5 条 × 10s）再换码，超时放宽
+    data, raw = _luban_request(LUBAN_EXCHANGE_PATH, method="POST", body=payload,
+                               token=token, timeout=120)
     return data if isinstance(data, dict) else {"raw": raw}
-
-
-def _luban_proxy_url_by_id(base_url: str, proxy_id) -> str | None:
-    """按 luban 代理池 id 查完整代理 URL（GET /api/proxies，管理员 Bearer 拿到的 URL 带密码）。"""
-    if proxy_id in (None, ""):
-        return None
-    try:
-        pid = int(proxy_id)
-    except (TypeError, ValueError):
-        raise RuntimeError(f"LUBAN_BIND_PROXY_ID 不是整数: {proxy_id!r}")
-    if pid in _luban_proxy_url_cache:
-        return _luban_proxy_url_cache[pid]
-    data, raw = _request(base_url, LUBAN_PROXIES_PATH, LUBAN_ADMIN_PASSWORD, "", method="GET")
-    if not isinstance(data, list):
-        raise RuntimeError(f"luban /api/proxies 响应无法解析: {raw[:500]}")
-    for p in data:
-        if isinstance(p, dict) and p.get("id") == pid:
-            url = p.get("url")
-            if not url:
-                raise RuntimeError(f"luban 代理池 id={pid} 没有 url")
-            logger.info(f"luban 代理池 id={pid} ({p.get('label')}) 已解析为出站代理")
-            _luban_proxy_url_cache[pid] = url
-            return url
-    available = ", ".join(f"{p.get('id')}={p.get('label')}" for p in data if isinstance(p, dict)) or "（代理池为空）"
-    raise RuntimeError(f"luban 代理池里没有 id={pid}；可选: {available}")
 
 
 # ---------- default 后端：oauth-accounts 后台（POST auth-url + POST exchange） ----------

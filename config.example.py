@@ -33,6 +33,9 @@ KIRO_BROWSER_BACKEND = "camoufox"
 # claude-email / claude-bind 登录内核（环境变量 CLAUDE_LOGIN_BACKEND 或 --backend 可临时覆盖）
 # camoufox   : stealth Firefox（默认）
 # patchright : Playwright stealth 补丁版 + 系统真 Chrome，Camoufox 登不进 Claude 时的备选
+# seleniumbase: SeleniumBase UC 模式真 Chrome（首屏断开驱动过 Cloudflare，Turnstile 用系统鼠标真点），
+#              随后 Patchright 经 CDP 接管跑同一套登录流程；需 headful（macOS 给终端「辅助功能」权限，
+#              Linux 无显示时自动起 Xvfb），首次运行自动下载 uc_driver；profile 存 ~/.chrome-user-data（中性目录名）
 CLAUDE_LOGIN_BACKEND = "camoufox"
 
 # BotBrowser 后端所需外部资产（仅 backend=botbrowser 时生效）
@@ -226,10 +229,17 @@ OAUTH_BIND_POLICY_TEMPLATE_NAME = ""    # 如 "蒸馏"；按模板名自动解�
 OAUTH_BIND_BACKEND             = "default"
 # luban 后端（OAUTH_BIND_BACKEND="luban" 时生效）；走 /api/authorize + /api/exchange
 LUBAN_BASE_URL                 = "http://127.0.0.1:4600"   # luban 地址（默认端口 4600）
-LUBAN_ADMIN_PASSWORD           = ""      # luban 网页「接入设置」里设的管理员密码（作 Bearer）
+# 鉴权二选一（上号 Key 优先）：
+LUBAN_PROVISION_KEY            = ""      # 上号 Key（lbp-…，网页账号菜单「上号 Key」里建）；只能上号，号归 Key 的创建者
+LUBAN_USERNAME                 = "admin" # 或用控制台用户名 + 密码登录换会话 token
+LUBAN_ADMIN_PASSWORD           = ""      # 该用户的登录密码
 LUBAN_BIND_LABEL               = None    # exchange 可选显示名；留空由 luban 自动命名
-LUBAN_BIND_PROXY               = None    # exchange 可选出站代理；留空直连
-LUBAN_BIND_PROXY_ID            = None    # 或只填 luban 代理池 id（网页「代理池」里的 id），自动解析成 URL；上面 URL 非空时以 URL 为准
+# 出站代理（二选一，URL 优先）；都留空时：上号 Key 由 luban 从本人代理池自动挑一条测通的，登录方式直连
+LUBAN_BIND_PROXY               = None    # 代理 URL
+LUBAN_BIND_PROXY_ID            = None    # 本人代理池里的 id（网页「代理池」里的 id）
+# 号池分组（二选一，id 优先）；都留空进默认分组
+LUBAN_BIND_GROUP_IDS           = []      # 如 [2, 3]
+LUBAN_BIND_GROUP_NAMES         = []      # 如 ["蒸馏"]；按分组名自动解析 id
 
 # ═══════════════════════════════════════════════════════════════════
 # MXroute 邮箱 API（python main.py email）

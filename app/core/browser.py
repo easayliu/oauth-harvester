@@ -1,7 +1,7 @@
 """浏览器/通用工具：CloakBrowser 启动、拟人操作、截图、Cloudflare 等待、TOTP（由 main.py 拆分而来）"""
 
 from collections import namedtuple
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timedelta
 import asyncio
 import functools
@@ -269,7 +269,40 @@ KIRO_FIREFOX_PROFILE_ROOT = os.path.expanduser("~/.kiro-firefox-profiles")
 KIRO_WEBKIT_PROFILE_ROOT = os.path.expanduser("~/.kiro-webkit-profiles")
 KIRO_BOTBROWSER_PROFILE_ROOT = os.path.expanduser("~/.kiro-botbrowser-profiles")
 KIRO_REALCHROME_PROFILE_ROOT = os.path.expanduser("~/.kiro-realchrome-profiles")
-KIRO_PATCHRIGHT_PROFILE_ROOT = os.path.expanduser("~/.kiro-patchright-profiles")
+# 两个真 Chrome 内核的 profile 根目录用中性名字：Chrome 的 user-data-dir 路径会出现在
+# chrome://version 等处，"patchright" / "seleniumbase" 这种一看就是自动化框架的目录名
+# 没必要留在路径里。旧目录（~/.kiro-patchright-profiles 等）首次用到时自动改名迁移。
+KIRO_PATCHRIGHT_PROFILE_ROOT = os.path.expanduser("~/.chrome-profiles")
+KIRO_SELENIUMBASE_PROFILE_ROOT = os.path.expanduser("~/.chrome-user-data")
+_LEGACY_PROFILE_ROOTS = {
+    KIRO_PATCHRIGHT_PROFILE_ROOT: os.path.expanduser("~/.kiro-patchright-profiles"),
+    KIRO_SELENIUMBASE_PROFILE_ROOT: os.path.expanduser("~/.kiro-seleniumbase-profiles"),
+}
+
+
+def _migrate_legacy_profile_root(root: str) -> None:
+    """旧根目录存在就搬到新名字下：新目录不存在直接整体改名；两边都有则逐个搬不冲突的
+    profile，冲突的保留新目录里的。只在第一次碰到时做一次，失败只记日志不影响登录。"""
+    old = _LEGACY_PROFILE_ROOTS.get(root)
+    if not old or not os.path.isdir(old) or os.path.islink(old):
+        return
+    try:
+        if not os.path.exists(root):
+            os.rename(old, root)
+            logger.info(f"profile 根目录已改名: {old} → {root}")
+            return
+        moved = 0
+        for name in os.listdir(old):
+            src, dst = os.path.join(old, name), os.path.join(root, name)
+            if os.path.exists(dst):
+                continue
+            shutil.move(src, dst)
+            moved += 1
+        if not os.listdir(old):
+            os.rmdir(old)
+        logger.info(f"profile 根目录迁移: {old} → {root}（搬了 {moved} 个 profile）")
+    except Exception as e:
+        logger.warning(f"profile 根目录迁移失败（忽略，继续用 {root}）: {old}: {e}")
 
 # AWS 系列（aws / aws-claude / aws-kiro）登录会话持久化目录：按 admin 邮箱存一份
 # storage_state（cookie + localStorage），下次跑同一账号直接复用、跳过 root 登录。
@@ -416,7 +449,9 @@ def get_kiro_profile_dir(email: str, browser: str = "chrome") -> str:
             "webkit": KIRO_WEBKIT_PROFILE_ROOT,
             "botbrowser": KIRO_BOTBROWSER_PROFILE_ROOT,
             "realchrome": KIRO_REALCHROME_PROFILE_ROOT,
-            "patchright": KIRO_PATCHRIGHT_PROFILE_ROOT}.get(browser, KIRO_PROFILE_ROOT)
+            "patchright": KIRO_PATCHRIGHT_PROFILE_ROOT,
+            "seleniumbase": KIRO_SELENIUMBASE_PROFILE_ROOT}.get(browser, KIRO_PROFILE_ROOT)
+    _migrate_legacy_profile_root(root)
     _enforce_kiro_profile_limits(root)
     path = os.path.join(root, safe)
     os.makedirs(path, exist_ok=True)
@@ -1340,22 +1375,209 @@ async def _close_patchright_persistent_context(handle) -> None:
 
 
 # ============================================================
+# SeleniumBase UC 模式 + Patchright CDP 接管（claude-email --backend seleniumbase）
+# ------------------------------------------------------------
+# SeleniumBase UC Mode（undetected-chromedriver 加强版）过 Cloudflare 的两个关键动作：
+#   · 打开页面时先 disconnect chromedriver —— 首屏/Turnstile 校验期间浏览器里没有任何
+#     自动化连接，Cloudflare 看到的就是一个干净的真 Chrome；
+#   · 遇到 Turnstile 用 pyautogui 走系统鼠标真点一下（uc_gui_click_captcha）。
+# 但登录流程（填邮箱/推引导/取 cookie）全写在 Playwright 页面 API 上，不想为它再写一套
+# Selenium 版，所以采用「混合」：SeleniumBase 负责启动 + 过首屏，然后再次 disconnect
+# chromedriver，由 Patchright（同样不发 Runtime.enable）connect_over_cdp 接管同一个
+# Chrome，后续流程原样复用。关闭时先断 Patchright，再 driver.quit() 杀 Chrome。
+#
+# 限制：
+#   · profile 根目录 ~/.chrome-user-data（中性名，不带框架名）；
+#   · pyautogui 点 Turnstile 需要真实/虚拟显示：macOS 要给终端「辅助功能」权限；
+#     Linux 无 X11 时自动起 Xvfb（HEADLESS=True → "virtual"）；真 headless 下不点。
+#   · 带账密的 socks5 由 proxy_relay 转成本地无认证中转（SeleniumBase 也不认）。
+# ============================================================
+def _seleniumbase_proxy_string(url: str) -> str | None:
+    """把代理 URL 转成 SeleniumBase 认的 proxy 串：
+    socks5(h)://host:port → socks5://host:port；http(s)://[user:pass@]host:port 原样；
+    留空返回 None。带账密的 socks 应先经 ensure_relay 换成本地无认证 URL 再传进来。"""
+    if not url:
+        return None
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    scheme = (parts.scheme or "http").lower()
+    if scheme == "socks5h":
+        scheme = "socks5"
+    host = f"{parts.hostname}:{parts.port}" if parts.port else parts.hostname
+    if parts.username and not scheme.startswith("socks"):
+        return f"{scheme}://{parts.username}:{parts.password or ''}@{host}"
+    return f"{scheme}://{host}"
+
+
+def _seleniumbase_debugger_address(driver) -> str:
+    """取 UC Chrome 的 --remote-debugging 地址（host:port），给 connect_over_cdp 用。"""
+    opts = getattr(driver, "options", None)
+    addr = getattr(opts, "debugger_address", None)
+    if addr:
+        return addr
+    for a in (getattr(opts, "arguments", None) or []):
+        if a.startswith("--remote-debugging-port="):
+            return f"127.0.0.1:{a.split('=', 1)[1]}"
+    raise RuntimeError("SeleniumBase UC Chrome 未暴露 remote-debugging 端口，无法让 Patchright 接管")
+
+
+async def _launch_seleniumbase_persistent_context(user_data_dir: str, *,
+                                                  locale: str = None,
+                                                  timezone: str = None,
+                                                  headless: bool = None,
+                                                  proxy: str = None,
+                                                  landing_url: str = "https://claude.ai/login"):
+    """SeleniumBase UC Chrome 启动 + 过 Cloudflare 首屏，再由 Patchright 经 CDP 接管。
+    返回 (context, handle)；handle=(driver, display, pw, browser) 交给
+    _close_seleniumbase_persistent_context() 清理。
+    locale/timezone/headless/proxy 语义与 _launch_patchright_persistent_context 对齐。"""
+    from app.core.proxy_relay import ensure_relay
+    from patchright.async_api import async_playwright
+
+    w, h = _camoufox_window_size()
+    raw_proxy = proxy or PROXY
+    local_relay = await ensure_relay(raw_proxy)
+    proxy_str = _seleniumbase_proxy_string(local_relay or raw_proxy)
+    _hv = _camoufox_headless_value(headless)
+    headless_val = False if _hv == "virtual" else bool(_hv)
+    if headless_val:
+        logger.warning("SeleniumBase 真 headless 下 UC 模式过 Cloudflare 的效果大打折扣，"
+                       "且无法用鼠标点 Turnstile；建议 --no-headless（Linux 用 HEADLESS=True 自动起 Xvfb）")
+    eff_locale = locale or BROWSER_LOCALE or "en-US"
+    eff_tz = timezone or BROWSER_TIMEZONE
+    logger.info(
+        f"启动 SeleniumBase UC Chrome (profile={user_data_dir}, headless={headless_val}, "
+        f"virtual_display={_hv == 'virtual'}, window={w}x{h}, "
+        f"proxy={'yes' if proxy_str else 'no'}, locale={eff_locale}, tz={eff_tz or 'system'})"
+    )
+
+    def _start_sync():
+        """同步部分（Selenium API 是阻塞的）：起虚拟显示 → Driver(uc) → 开首屏 → 过 Turnstile → 断 chromedriver。"""
+        display = None
+        if _hv == "virtual" and not os.environ.get("DISPLAY"):
+            try:
+                from sbvirtualdisplay import Display
+                display = Display(visible=False, size=(w, h))
+                display.start()
+                logger.info("已启动 Xvfb 虚拟显示（SeleniumBase 需要有显示才能 headful + 点 Turnstile）")
+            except Exception as e:
+                logger.warning(f"启动 Xvfb 失败（{e}），退化为真 headless")
+        from seleniumbase import Driver
+        old_tz = os.environ.get("TZ")
+        if eff_tz:
+            os.environ["TZ"] = eff_tz   # Chrome 子进程继承，等价 camoufox 的 env={"TZ"}
+        try:
+            driver = Driver(
+                uc=True,
+                headless=headless_val if not (display is None and _hv == "virtual") else True,
+                headed=not headless_val,
+                user_data_dir=user_data_dir,
+                proxy=proxy_str,
+                locale_code=eff_locale,            # 只设 intl.accept_languages 偏好
+                # UC 模式会按 Python 进程的 locale 自己拼 --lang（LANG=C 时拼出 --lang=C），
+                # 与 accept_languages 不一致；显式给 --lang 它就不再自作主张
+                chromium_arg=f"--lang={eff_locale}",
+                window_size=f"{w},{h}",
+                window_position="0,0",
+            )
+        finally:
+            if eff_tz:
+                if old_tz is None:
+                    os.environ.pop("TZ", None)
+                else:
+                    os.environ["TZ"] = old_tz
+        try:
+            # 首屏：断开 chromedriver 再加载，让 Cloudflare 看不到自动化痕迹
+            driver.uc_open_with_reconnect(landing_url, reconnect_time=5)
+            if not headless_val:
+                try:
+                    # 不在 Turnstile 页时立刻返回 False；在则用系统鼠标真点，retry 再试一次
+                    clicked = driver.uc_gui_click_captcha(retry=True)
+                    if clicked:
+                        logger.info("SeleniumBase 已点击 Cloudflare Turnstile")
+                        time.sleep(3)
+                except Exception as e:
+                    logger.warning(f"uc_gui_click_captcha 失败（忽略，交给后续流程）: {e}")
+            try:
+                logger.info(f"SeleniumBase 首屏就绪: {driver.current_url}")
+            except Exception:
+                pass
+            # 把 chromedriver 彻底断开，之后只剩 Patchright 一条 CDP 连接
+            driver.disconnect()
+        except Exception:
+            with suppress(Exception):
+                driver.quit()
+            if display:
+                with suppress(Exception):
+                    display.stop()
+            raise
+        return driver, display
+
+    driver, display = await asyncio.to_thread(_start_sync)
+    pw = await async_playwright().start()
+    try:
+        addr = _seleniumbase_debugger_address(driver)
+        browser = await pw.chromium.connect_over_cdp(f"http://{addr}", timeout=30000)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        logger.info(f"Patchright 已通过 CDP 接管 SeleniumBase Chrome ({addr}, pages={len(context.pages)})")
+    except Exception:
+        with suppress(Exception):
+            await pw.stop()
+        await asyncio.to_thread(_quit_seleniumbase_driver, driver, display)
+        raise
+    return context, (driver, display, pw, browser)
+
+
+def _quit_seleniumbase_driver(driver, display) -> None:
+    """杀掉 UC Chrome（driver.quit 直接 SIGTERM 浏览器进程）并停掉 Xvfb。内部吞异常。"""
+    try:
+        driver.quit()
+    except Exception as e:
+        logger.warning(f"关闭 SeleniumBase Chrome 失败（忽略）: {e}")
+    if display:
+        try:
+            display.stop()
+        except Exception as e:
+            logger.warning(f"停止 Xvfb 失败（忽略）: {e}")
+
+
+async def _close_seleniumbase_persistent_context(handle) -> None:
+    """关闭 _launch_seleniumbase_persistent_context 返回的 handle。
+    顺序：先断 Patchright（connect_over_cdp 的 browser.close 只是断连）→ 停 playwright → quit Chrome。"""
+    if not handle:
+        return
+    driver, display, pw, browser = handle
+    try:
+        await browser.close()
+    except Exception as e:
+        logger.warning(f"断开 Patchright CDP 连接失败（忽略）: {e}")
+    try:
+        await pw.stop()
+    except Exception as e:
+        logger.warning(f"停止 Patchright playwright 失败（忽略）: {e}")
+    await asyncio.to_thread(_quit_seleniumbase_driver, driver, display)
+
+
+# ============================================================
 # claude-email / claude-bind 登录浏览器统一入口
 # ------------------------------------------------------------
 # 按 backend 选内核，对调用方屏蔽「camoufox 返回 cm / patchright 返回 (context, pw)」
 # 的差异：统一返回 (context, handle)，handle 交给 close_claude_login_context() 清理。
 # 两内核 profile 不兼容（Firefox ↔ Chromium），按 backend 分流到不同 profile root。
 # ============================================================
-CLAUDE_LOGIN_BACKENDS = ("camoufox", "patchright")
+CLAUDE_LOGIN_BACKENDS = ("camoufox", "patchright", "seleniumbase")
 
 
 def claude_login_backend(override: str = None) -> str:
-    """claude-email/claude-bind 登录内核：'camoufox'(默认 Firefox) / 'patchright'(真 Chrome)。
+    """claude-email/claude-bind 登录内核：'camoufox'(默认 Firefox) / 'patchright'(真 Chrome)
+    / 'seleniumbase'(UC 模式真 Chrome 过 Cloudflare，再由 Patchright 接管)。
     优先级：显式 override（--backend）> 环境变量 CLAUDE_LOGIN_BACKEND > config > 'camoufox'。"""
     raw = (override or os.getenv("CLAUDE_LOGIN_BACKEND")
            or CLAUDE_LOGIN_BACKEND or "camoufox").strip().lower()
     if raw in ("patchright", "chrome", "chromium", "real-chrome", "realchrome"):
         return "patchright"
+    if raw in ("seleniumbase", "sb", "uc", "uc-chrome", "undetected"):
+        return "seleniumbase"
     return "camoufox"
 
 
@@ -1372,6 +1594,11 @@ async def launch_claude_login_context(email: str, *, backend: str = None,
         context, pw = await _launch_patchright_persistent_context(
             profile_dir, locale=locale, timezone=timezone, headless=headless, proxy=proxy)
         return context, profile_dir, ("patchright", (context, pw))
+    if be == "seleniumbase":
+        profile_dir = get_kiro_profile_dir(email, browser="seleniumbase")
+        context, h = await _launch_seleniumbase_persistent_context(
+            profile_dir, locale=locale, timezone=timezone, headless=headless, proxy=proxy)
+        return context, profile_dir, ("seleniumbase", h)
     profile_dir = get_kiro_profile_dir(email, browser="firefox")
     context, cm = await launch_camoufox_persistent_context(
         profile_dir, locale=locale, timezone=timezone, os_name=os_name,
@@ -1386,6 +1613,9 @@ async def close_claude_login_context(handle) -> None:
     kind, h = handle
     if kind == "patchright":
         await _close_patchright_persistent_context(h)
+        return
+    if kind == "seleniumbase":
+        await _close_seleniumbase_persistent_context(h)
         return
     await close_camoufox_persistent_context(h)
 

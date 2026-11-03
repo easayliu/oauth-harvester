@@ -478,7 +478,7 @@ async def claude_login_after_google(
             last_url = current_url
 
         # 已进入对话页面
-        if "claude.ai/new" in current_url or "claude.ai/chat" in current_url:
+        if any(p in current_url for p in ("claude.ai/new", "claude.ai/chat", "claude.ai/cowork")):
             logger.info("已进入 Claude 对话页面！")
             break
 

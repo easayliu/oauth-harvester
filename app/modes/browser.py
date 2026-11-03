@@ -193,8 +193,68 @@ def _imap_host_for_domain(domain: str) -> str:
     return _IMAP_HOST_MAP.get(domain, f"imap.{domain}" if domain else "")
 
 
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _extract_card_fields(cred: str) -> dict:
+    """从一条凭据串里抽取卡密各字段，容忍缺省。claude-email 与 claude-bind-session
+    共用，避免两套解析逻辑分叉。
+
+    完整卡密：email----password----ClientId----refresh_token----辅助邮箱----辅助密码----sk
+    也兼容：email----app_password / email:password / 纯 email。
+
+    返回 {email, password, client_id, refresh_token, session_key}（缺省为空串）。
+    - ClientId 用 UUID 正则定位，refresh_token 取其紧随的下一段（Outlook 个人号 XOAUTH2 用）。
+    - sk 用正则定位（key 内含 -- 但不含 ----，不会被字段分隔符截断）。
+    - password 取主邮箱后紧跟的一段，排除 ClientId / 令牌 / 辅助邮箱。
+    """
+    sk = ""
+    m = re.search(r"sk-ant-(?:(?!----)\S)+", cred)
+    if m:
+        sk = m.group(0)
+        cred = cred[:m.start()] + cred[m.end():]
+
+    colon_pair = False          # email:password 冒号形式，密码即第二段（可含 @）
+    if "----" in cred:
+        parts = [p.strip() for p in cred.split("----") if p.strip()]
+    elif ":" in cred:
+        e, p = cred.split(":", 1)
+        parts = [x for x in (e.strip(), p.strip()) if x]
+        colon_pair = True
+    else:
+        parts = [cred.strip()] if cred.strip() else []
+
+    email = next((p for p in parts if "@" in p), "")       # 首个含 @ 的即主邮箱
+    client_id = next((p for p in parts if _UUID_RE.match(p)), "")
+    refresh_token = ""
+    if client_id:
+        ci = parts.index(client_id)
+        if ci + 1 < len(parts):                            # 令牌紧跟 ClientId 之后
+            refresh_token = parts[ci + 1]
+
+    password = ""
+    if email in parts:
+        ei = parts.index(email)
+        if ei + 1 < len(parts):
+            cand = parts[ei + 1]                           # 主邮箱后紧跟的一段
+            # 冒号形式 email:password 的密码即第二段，可含 @（如 Jhkjlopv@2）；
+            # 纯 email----password（无 ClientId 的卡）第二段也一定是密码，哪怕含 @
+            # （如 mxrouting 密码结尾带 @：^N*hiKFk0fcGcJ8@）；只有含 ClientId 的
+            # 完整 Outlook 卡里，含 @ 的第二段才可能是辅助邮箱，需要排除。
+            if cand != client_id and cand != refresh_token and (
+                    colon_pair or not client_id or "@" not in cand):
+                password = cand
+
+    return {"email": email, "password": password,
+            "client_id": client_id, "refresh_token": refresh_token,
+            "session_key": sk}
+
+
 def _parse_mail_account(raw: str):
-    """解析 claude-mail 账号输入，返回 (host, port, email, password)。支持两种格式：
+    """解析 claude-mail 账号输入，返回 (host, port, email, password, client_id, refresh_token)。
+
+    支持两种输入格式：
 
     1) 两行显式 IMAP 服务器（推荐，支持任意邮箱）：
          imap.nifty.com:993
@@ -205,6 +265,11 @@ def _parse_mail_account(raw: str):
     2) 单行旧格式（按域名自动推断服务器，主要给 Yahoo）：
          jessica_martin78099@yahoo.com----phvzlvexrxpvhyvg
 
+    3) 完整卡密（Outlook/Hotmail 个人号，走 IMAP XOAUTH2）：
+         email----密码----ClientId----refresh_token----辅助邮箱----辅助密码----sk
+       抽出 ClientId(UUID)+refresh_token 供个人号 XOAUTH2 取件，其余段忽略。
+
+    凭据字段解析复用 _extract_card_fields（与 claude-bind-session 同一套）。
     解析失败返回 None。
     """
     lines = [ln.strip() for ln in (raw or "").strip().splitlines() if ln.strip()]
@@ -237,17 +302,18 @@ def _parse_mail_account(raw: str):
     if not cred:
         return None
 
-    # 拆 email 和 password：优先 ----，否则按第一个 : 拆（email 不含 :）
-    if "----" in cred:
-        email_addr, password = cred.split("----", 1)
-    elif ":" in cred:
-        email_addr, password = cred.split(":", 1)
-    else:
-        return None
+    # 复用共用解析：兼容 email----app_password、email:password，以及完整卡密
+    # （email----pwd----ClientId----令牌----辅助邮箱----辅助密码----sk）。
+    fields = _extract_card_fields(cred)
+    email_addr = fields["email"]
+    password = fields["password"]
+    client_id = fields["client_id"]
+    refresh_token = fields["refresh_token"]
 
-    email_addr = email_addr.strip()
-    password = password.strip()
-    if not email_addr or not password or "@" not in email_addr:
+    if not email_addr or "@" not in email_addr:
+        return None
+    # Outlook 个人号靠 ClientId+令牌 走 XOAUTH2，可无密码；否则必须有密码
+    if not password and not (client_id and refresh_token):
         return None
 
     if not host:
@@ -255,11 +321,12 @@ def _parse_mail_account(raw: str):
     if not host:
         return None
 
-    return host, port, email_addr, password
+    return host, port, email_addr, password, client_id, refresh_token
 
 
 def _parse_mail_account_file(path: str) -> list:
-    """解析批量账号文件，返回 [(host, port, email, password), ...]。支持两种布局：
+    """解析批量账号文件，返回 [(host, port, email, password, client_id, refresh_token), ...]。
+    凭据行支持完整卡密（含 Outlook ClientId+令牌）。支持两种布局：
 
     A) 共享 IMAP 服务器（首行是服务器行，其后每行一个凭据）：
          glacier.mxrouting.net:993
@@ -532,67 +599,91 @@ def _imap_login(imap, email_addr: str, app_password: str = "", access_token: str
         imap.login(email_addr, app_password)
 
 
-def _imap_latest_uid(host: str, port: int, email_addr: str, app_password: str,
-                     access_token: str = "") -> int:
-    """记录触发发信前 INBOX 里的最大 UID，作为「只认新邮件」的基准线。失败返回 0。"""
+# 登录邮件可能被邮箱判为垃圾（Outlook 尤其爱把 Claude 登录邮件丢进 Junk）。
+# 这些文件夹都扫；不存在的会在 select 时跳过。注意各文件夹 UID 空间互相独立，
+# 基准 UID 必须按文件夹分别记录，不能拿 INBOX 的基准去过滤 Junk。
+_MAIL_BOX_CANDIDATES = ("INBOX", "Junk", "Junk Email", "Junk E-mail", "Spam", "Bulk Mail")
+
+
+def _imap_mailbox_baselines(host: str, port: int, email_addr: str, app_password: str,
+                            access_token: str = "",
+                            boxes=_MAIL_BOX_CANDIDATES) -> dict:
+    """返回 {文件夹: 当前最大UID}，作为「只认新邮件」的基准线（含 INBOX + 垃圾箱）。
+    打不开的文件夹跳过；整体失败返回 {'INBOX': 0}。"""
+    out = {}
     try:
         with imaplib.IMAP4_SSL(host, port, timeout=30) as imap:
             _imap_login(imap, email_addr, app_password, access_token)
-            imap.select("INBOX")
-            typ, data = imap.uid("search", None, "ALL")
-            ids = data[0].split() if typ == "OK" and data and data[0] else []
-            return int(ids[-1]) if ids else 0
+            for box in boxes:
+                try:
+                    typ, _ = imap.select(box, readonly=True)
+                    if typ != "OK":
+                        continue
+                    typ, data = imap.uid("search", None, "ALL")
+                    ids = data[0].split() if typ == "OK" and data and data[0] else []
+                    out[box] = int(ids[-1]) if ids else 0
+                except Exception:
+                    continue  # 该文件夹不存在/无权限，跳过
     except Exception as e:
-        logger.warning(f"读取 Yahoo INBOX 基准 UID 失败（按 0 处理）: {e}")
-        return 0
+        logger.warning(f"读取收件箱基准 UID 失败（按空处理）: {e}")
+    return out or {"INBOX": 0}
 
 
 def _imap_wait_new_magic_link(host: str, port: int, email_addr: str, app_password: str,
-                              baseline_uid: int,
+                              baselines,
                               timeout_s: int = 180, poll_interval_s: int = 6,
                               sender: str = "anthropic", kind: str = "link",
                               delete: bool = False, access_token: str = "") -> str:
-    """轮询 IMAP，只在 UID 大于 baseline 的新登录邮件里找登录凭据。
+    """轮询 IMAP，只在 UID 大于各文件夹基准的新登录邮件里找登录凭据。
+    baselines：{文件夹: 基准UID} 字典（含 INBOX + 垃圾箱）；兼容传 int（视作仅 INBOX）。
     sender 为发件人过滤关键字（claude→anthropic，chatgpt→openai）。
     kind="link" 返回 magic link 完整 URL；kind="code" 返回数字验证码。超时返回空串。
     delete=True 时提取成功后删除命中的那封邮件。"""
+    # 兼容旧调用：传 int 时当作仅扫 INBOX
+    if isinstance(baselines, int):
+        baselines = {"INBOX": baselines}
     what = "验证码" if kind == "code" else "登录链接"
     logger.info(
         f"开始通过 IMAP {host}:{port} 等待新登录邮件"
-        f"（{email_addr}，基准 UID={baseline_uid}，发件人~{sender}，抓取{what}）...")
+        f"（{email_addr}，基准 {baselines}，发件人~{sender}，抓取{what}）...")
     end = time.time() + timeout_s
     while time.time() < end:
         try:
             with imaplib.IMAP4_SSL(host, port, timeout=30) as imap:
                 _imap_login(imap, email_addr, app_password, access_token)
-                imap.select("INBOX")
-                typ, data = imap.uid("search", None, f'(FROM "{sender}")')
-                ids = data[0].split() if typ == "OK" and data and data[0] else []
-                # 找不到就退回全量，兼容发件域不含 sender 的情况
-                if not ids:
-                    typ, data = imap.uid("search", None, "ALL")
-                    ids = data[0].split() if typ == "OK" and data and data[0] else []
-                new_ids = [i for i in ids if int(i) > baseline_uid]
-                for uid in reversed(new_ids):  # 最新的优先
-                    typ, msg_data = imap.uid("fetch", uid, "(RFC822)")
-                    if typ != "OK" or not msg_data or not msg_data[0]:
+                # 逐个文件夹扫（INBOX 优先，再 Junk 等），各用各自的基准 UID
+                for box, base in baselines.items():
+                    typ, _ = imap.select(box)
+                    if typ != "OK":
                         continue
-                    msg = email_pkg.message_from_bytes(msg_data[0][1])
-                    subject = _decode_mime_header(msg.get("Subject", ""))
-                    from_addr = _decode_mime_header(msg.get("From", ""))
-                    body = _extract_email_body(msg)
-                    if kind == "code":
-                        # 验证码可能出现在正文，也可能在主题里，两处都找
-                        result = _extract_chatgpt_code(body) or _extract_chatgpt_code(subject)
-                    else:
-                        result = _extract_claude_link(body)
-                    if result:
-                        logger.info(f"命中新邮件 UID={uid.decode() if isinstance(uid, bytes) else uid}: "
-                                    f"subject={subject[:60]!r} from={from_addr[:50]!r}")
-                        logger.info(f"提取到{what}: {result[:120]}")
-                        if delete:
-                            imap_delete_uid(imap, uid)
-                        return result
+                    typ, data = imap.uid("search", None, f'(FROM "{sender}")')
+                    ids = data[0].split() if typ == "OK" and data and data[0] else []
+                    # 找不到就退回全量，兼容发件域不含 sender 的情况
+                    if not ids:
+                        typ, data = imap.uid("search", None, "ALL")
+                        ids = data[0].split() if typ == "OK" and data and data[0] else []
+                    new_ids = [i for i in ids if int(i) > base]
+                    for uid in reversed(new_ids):  # 最新的优先
+                        typ, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                        if typ != "OK" or not msg_data or not msg_data[0]:
+                            continue
+                        msg = email_pkg.message_from_bytes(msg_data[0][1])
+                        subject = _decode_mime_header(msg.get("Subject", ""))
+                        from_addr = _decode_mime_header(msg.get("From", ""))
+                        body = _extract_email_body(msg)
+                        if kind == "code":
+                            # 验证码可能出现在正文，也可能在主题里，两处都找
+                            result = _extract_chatgpt_code(body) or _extract_chatgpt_code(subject)
+                        else:
+                            result = _extract_claude_link(body)
+                        if result:
+                            uid_s = uid.decode() if isinstance(uid, bytes) else uid
+                            logger.info(f"命中新邮件 [{box}] UID={uid_s}: "
+                                        f"subject={subject[:60]!r} from={from_addr[:50]!r}")
+                            logger.info(f"提取到{what}: {result[:120]}")
+                            if delete:
+                                imap_delete_uid(imap, uid)
+                            return result
         except imaplib.IMAP4.error as e:
             logger.warning(f"IMAP 登录/协议错误: {e}")
             return ""
@@ -715,7 +806,8 @@ async def run_claude_mail(mode: str, raw_input: str, is_file: bool):
         print("  2) 单行: email----app_password（按域名推断服务器）")
         exit(1)
 
-    imap_host, imap_port, email_addr, app_password = parsed
+    # claude-mail 走纯 IMAP 密码取件，不用卡密里的 ClientId/令牌，忽略后两段
+    imap_host, imap_port, email_addr, app_password, _client_id, _refresh_token = parsed
     # Yahoo 应用专用密码带空格，去掉；其他服务器密码保留原样
     if "yahoo" in imap_host.lower():
         app_password = app_password.replace(" ", "")
@@ -728,10 +820,10 @@ async def run_claude_mail(mode: str, raw_input: str, is_file: bool):
     logger.info(f"IMAP 收件服务器: {imap_host}:{imap_port}（{email_addr}）")
     profile_dir = get_kiro_profile_dir(email_addr, browser="realchrome")
 
-    # 记录发信前的收件箱基准 UID，确保只认之后到达的新登录邮件
-    baseline_uid = await asyncio.to_thread(
-        _imap_latest_uid, imap_host, imap_port, email_addr, app_password)
-    logger.info(f"收件箱基准 UID={baseline_uid}（只抓此后到达的新邮件）")
+    # 记录发信前各文件夹（INBOX + 垃圾箱）的基准 UID，确保只认之后到达的新登录邮件
+    baselines = await asyncio.to_thread(
+        _imap_mailbox_baselines, imap_host, imap_port, email_addr, app_password)
+    logger.info(f"收件箱基准 UID={baselines}（只抓此后到达的新邮件）")
 
     # subprocess 干净启动真 Chrome（与 chrome 模式完全一致的启动方式，零自动化痕迹）
     args = [
@@ -773,7 +865,7 @@ async def run_claude_mail(mode: str, raw_input: str, is_file: bool):
     # 后台轮询 IMAP 抓新登录凭据（放宽超时给手动提交留时间）
     result = await asyncio.to_thread(
         _imap_wait_new_magic_link, imap_host, imap_port, email_addr, app_password,
-        baseline_uid, 300, 6, flavor["sender"], flavor["kind"], delete_after
+        baselines, 300, 6, flavor["sender"], flavor["kind"], delete_after
     )
 
     if result and is_code:
@@ -910,9 +1002,12 @@ def _is_account_restricted_url(url: str) -> bool:
 
 async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
                                        email_addr: str, screenshot_path) -> str | None:
-    """在已登录 Claude 的页面打开授权链接 → 点 Authorize → 抓回跳的授权码。
+    """在 page（调用方新开的授权 tab，与已登录 Claude 同 context）打开授权链接 →
+    点 Authorize → 抓回跳的授权码。
 
     若 authorize 被强制登出（involuntary logout / reauth）抛 _ReauthRequired。"""
+    from app.accounts.claude import _claude_advance_onboarding
+
     logger.info(f"打开授权链接: {auth_url}")
     try:
         await page.goto(auth_url, wait_until="domcontentloaded", timeout=45000)
@@ -959,10 +1054,11 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
             logger.info(f"授权中... ({(i+1)*2}s) URL: {cur}")
             last_url = cur
 
-        # 2.5) 邀请拦截页：authorize 前先被跳到 /invites?returnTo=%2Foauth%2Fauthorize...，
+        # 2.5) 邀请拦截页：authorize 前先被跳到 /invites 或 /onboarding（?returnTo=%2Foauth%2Fauthorize...），
         #      需先点 "Accept invite" 才会带着 returnTo 继续回到 /oauth/authorize 同意页。
+        #      bind 跳过了登录时的 onboarding，这里落到 /onboarding 且没有邀请按钮时，补走引导。
         try:
-            if "/invites" in page.url:
+            if "/invites" in cur or "/onboarding" in cur:
                 invite_btn = page.locator(
                     'button:has-text("Accept invite"), button:has-text("Accept"), '
                     'button:has-text("接受"), a:has-text("Accept invite")'
@@ -973,13 +1069,17 @@ async def _oauth_authorize_and_capture(page, auth_url: str, pending_state: str,
                     logger.info("已点击 Accept invite，等待回到授权页")
                     try:
                         await page.wait_for_url(
-                            lambda u: "/invites" not in u,
-                            wait_until="commit", timeout=15000)
+                            lambda u: u != cur, wait_until="commit", timeout=15000)
                     except Exception:
                         pass
                     continue
+                if "/onboarding" in cur:
+                    action = await _claude_advance_onboarding(page, email_addr)
+                    if action:
+                        logger.info(f"授权前自动通过注册引导: {action}")
+                        continue
         except Exception as e:
-            logger.debug(f"点击 Accept invite 异常: {e}")
+            logger.debug(f"点击 Accept invite / 推进引导异常: {e}")
 
         # 3) 点授权按钮（仅限 /oauth/authorize 同意页；跳到 callback 后页面上不会再有）
         try:
@@ -1024,20 +1124,26 @@ async def _bind_account_to_backend(page, email_addr: str, screenshot_path,
 
     admin_token: 命令行 --admin-token= 传入的后台 access_token（非 vendor 账号），
     优先级高于 config 里的 OAUTH_ADMIN_API_TOKEN / REFRESH_TOKEN。
-    relogin: 可选的 async 重登回调；authorize 被强制登出（involuntary logout）时，
-    先重登一次再重新拉授权链接重试，最多重试一次。
+    relogin: 可选的 async 重登回调 relogin(login_page)；authorize 被强制登出
+    （involuntary logout）时，传入停在重登页的授权 tab 先重登一次，再重新拉授权链接
+    重试，最多重试一次。
+
+    授权链接在新 tab 打开（page 所在 tab 保留）；成功后关闭授权 tab，失败则保留便于手动完成。
     """
     from app.accounts import oauth_bind
 
     tok_kw = {"token": admin_token} if admin_token else {}
+    auth_page = None
 
     async def _authorize_once():
-        """拉一次全新授权链接并抓码；被强制登出时抛 _ReauthRequired。"""
+        """新开 tab 拉一次全新授权链接并抓码；被强制登出时抛 _ReauthRequired。"""
+        nonlocal auth_page
         auth_url, pending_state = await asyncio.to_thread(
             lambda: oauth_bind.get_auth_url(**tok_kw))
         logger.info(f"pending_state={pending_state}")
+        auth_page = await page.context.new_page()
         code = await _oauth_authorize_and_capture(
-            page, auth_url, pending_state, email_addr, screenshot_path)
+            auth_page, auth_url, pending_state, email_addr, screenshot_path)
         return code, pending_state
 
     try:
@@ -1049,10 +1155,15 @@ async def _bind_account_to_backend(page, email_addr: str, screenshot_path,
                 print("\n[bind] 授权时被强制重新登录（involuntary logout），已跳过加入后台。\n")
                 return False
             logger.info("授权被强制重新登录，正在用邮箱 magic-link 重新登录后重试授权...")
-            if not await relogin():
+            if not await relogin(auth_page):
                 logger.warning("重新登录失败，跳过绑定")
                 print("\n[bind] 重新登录失败，已跳过加入后台。\n")
                 return False
+            # 重登已完成（cookie 在 context 共享），旧授权 tab 关掉，重试时再新开
+            try:
+                await auth_page.close()
+            except Exception:
+                pass
             try:
                 code, pending_state = await _authorize_once()
             except _ReauthRequired:
@@ -1081,6 +1192,10 @@ async def _bind_account_to_backend(page, email_addr: str, screenshot_path,
         return False
 
     logger.info(f"exchange 成功: {result}")
+    try:
+        await auth_page.close()
+    except Exception:
+        pass
     data = result.get("data") if isinstance(result.get("data"), dict) else result
     print("\n" + "=" * 60)
     print(f"[bind] 账号已加入后台: {email_addr}")
@@ -1118,7 +1233,7 @@ async def _claude_profile_logged_in(page, context) -> bool:
         except Exception:
             cookies = []
         has_key = any(c.get("name") == "sessionKey" and c.get("value") for c in cookies)
-        if has_key and ("claude.ai/new" in cur or "claude.ai/chat" in cur):
+        if has_key and any(p in cur for p in ("claude.ai/new", "claude.ai/chat", "claude.ai/cowork")):
             return True
         await page.wait_for_timeout(1000)
     return False
@@ -1174,19 +1289,24 @@ _AUTO_MAIL_POLL_S = 3
 async def _claude_email_magic_login(page, email_addr, app_password, imap_host, imap_port,
                                     *, delete_after=False, interactive=True,
                                     client_id="", refresh_token="",
-                                    skip_landing_goto=False) -> bool:
+                                    skip_landing_goto=False, skip_onboarding=False) -> bool:
     """邮箱 magic-link 登录：打开 /login → 填邮箱提交 → IMAP 抓 magic link → 打开 →
     推进注册引导直到进入 /new。首登与 reauth 重登共用。
 
     client_id + refresh_token：Outlook/Hotmail 个人号用（卡密第 3、4 段），有则换
     access_token 走 IMAP XOAUTH2（个人号不支持密码 IMAP）；否则用 app_password 密码登录。
 
-    skip_landing_goto：reauth 重登用。被强制登出时页面已停在
+    skip_landing_goto：页面已在登录页时用。首登时 /new 未登录会自动跳到 /login；reauth
+    重登时被强制登出，页面已停在
     /login?reauth=1&returnTo=%2Foauth%2Fauthorize... 的邮箱输入页（带 returnTo），
     直接在当前页填邮箱即可；若再 goto 空的 /login 会丢掉 returnTo，登录后回不到授权页。
 
-    返回 True 表示 magic link 已成功打开（调用方可继续提取 sessionKey）；
-    返回 False 为硬失败（没找到输入框 / 没抓到登录链接），应中止。"""
+    skip_onboarding：bind 用。新号 magic link 落到 /onboarding 时只要已拿到 sessionKey
+    就视为登录完成，不再填名字/选兴趣等引导，直接交给上层打开授权链接。
+
+    magic link 在新 tab 打开（原登录页 tab 保留）。成功返回该新 tab 的 page
+    （调用方应改用它继续提取 sessionKey）；返回 None 为硬失败（没找到输入框 /
+    没抓到登录链接 / 验证页卡死），应中止。"""
     from app.core.browser import human_delay, screenshot_path as _screenshot_path
     from app.accounts.claude import _claude_advance_onboarding
 
@@ -1197,17 +1317,18 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
             _ms_oauth_access_token, client_id, refresh_token)
         if not access_token:
             logger.error("微软 refresh_token 换取 access_token 失败，无法 IMAP 取件")
-            return False
+            return None
 
-    # 抓本次登录前的收件箱基准 UID（紧挨提交，确保只认新到的登录邮件）
-    baseline_uid = await asyncio.to_thread(
-        _imap_latest_uid, imap_host, imap_port, email_addr, app_password, access_token)
-    logger.info(f"收件箱基准 UID={baseline_uid}")
+    # 抓本次登录前各文件夹（INBOX + 垃圾箱）的基准 UID，确保只认新到的登录邮件。
+    # Outlook 常把 Claude 登录邮件判为垃圾丢进 Junk，故必须连 Junk 一起扫。
+    baselines = await asyncio.to_thread(
+        _imap_mailbox_baselines, imap_host, imap_port, email_addr, app_password, access_token)
+    logger.info(f"收件箱基准 UID={baselines}")
 
     # 1. 打开 Claude 登录页（SPA + 代理下 domcontentloaded 易超时，用 commit 提速）
     if skip_landing_goto:
-        # reauth 重登：当前已在带 returnTo 的登录页，不再 goto（否则丢 returnTo）
-        logger.info(f"复用当前重登页（保留 returnTo），不再打开 claude.ai/login，当前 URL: {page.url}")
+        # 当前已在登录页（reauth 带 returnTo / 打开 /new 被跳转过来），不再 goto（否则丢 returnTo）
+        logger.info(f"复用当前登录页，不再打开 claude.ai/login，当前 URL: {page.url}")
     else:
         logger.info("正在打开 claude.ai/login...")
         try:
@@ -1236,7 +1357,7 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
         await page.screenshot(path=_screenshot_path("email_no_input", email_addr))
         if interactive and sys.stdin.isatty():
             input("未找到邮箱输入框，按回车键关闭浏览器...")
-        return False
+        return None
 
     # 3. 点击 "Continue with email"（严格匹配，避免误点 Google/Apple）
     submit_btn = page.locator(
@@ -1264,7 +1385,7 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
     logger.info(f"等待登录邮件（最长 {_AUTO_MAIL_WAIT_S}s）...")
     magic_link = await asyncio.to_thread(
         _imap_wait_new_magic_link, imap_host, imap_port, email_addr, app_password,
-        baseline_uid, _AUTO_MAIL_WAIT_S, _AUTO_MAIL_POLL_S, "anthropic", "link",
+        baselines, _AUTO_MAIL_WAIT_S, _AUTO_MAIL_POLL_S, "anthropic", "link",
         delete_after, access_token,
     )
     if not magic_link:
@@ -1272,10 +1393,12 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
         await page.screenshot(path=_screenshot_path("email_no_link", email_addr))
         if interactive and sys.stdin.isatty():
             input("未抓到登录链接，按回车键关闭浏览器...")
-        return False
+        return None
 
-    # 5. 在原页面打开 magic link（同一 context，cookie 共享）
-    logger.info("抓到登录链接，在原页面打开...")
+    # 5. 新开 tab 打开 magic link（模拟从邮件点链接；同一 context，cookie 共享）。
+    #    原登录页 tab 保留，后续流程都在新 tab 上进行。
+    logger.info("抓到登录链接，在新 tab 打开...")
+    page = await page.context.new_page()
     try:
         await page.goto(magic_link, wait_until="commit", timeout=45000)
     except Exception as e:
@@ -1325,7 +1448,7 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
                 logger.warning(f"magic-link 验证页卡住 {magic_stuck * 3}s 仍未登录，放弃。"
                                f"页面文本: {text[:200]!r}")
                 await page.screenshot(path=_screenshot_path("magic_link_failed", email_addr))
-                return False
+                return None
         else:
             magic_stuck = 0
         # 账号被 hold/restricted（access_denied / account_on_hold）→ 立即跳过，别空等
@@ -1333,9 +1456,18 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
             logger.warning(f"账号被 hold/restricted，URL={current_url}")
             await page.screenshot(path=_screenshot_path("account_on_hold", email_addr))
             raise _AccountOnHold()
-        if "claude.ai/new" in current_url or "claude.ai/chat" in current_url:
+        if any(p in current_url for p in ("claude.ai/new", "claude.ai/chat", "claude.ai/cowork")):
             logger.info(f"已进入 Claude 对话页面！URL: {current_url}")
             break
+        # bind：新号落到 /onboarding 时授权不依赖引导是否填完，有 sessionKey 就直接去授权
+        if skip_onboarding and "claude.ai/onboarding" in current_url:
+            try:
+                cks = await page.context.cookies("https://claude.ai")
+            except Exception:
+                cks = []
+            if any(c.get("name") == "sessionKey" and c.get("value") for c in cks):
+                logger.info(f"已拿到 sessionKey，跳过 onboarding 引导直接去授权，URL: {current_url}")
+                break
         # reauth 重登：magic link 带 returnTo 会直接回跳 /oauth/authorize（不经过 /new）。
         # 只要已拿到 sessionKey 且离开登录/登出页，即视为登录完成，授权交给上层重试。
         if ("/login" not in current_url and "/logout" not in current_url
@@ -1390,7 +1522,7 @@ async def _claude_email_magic_login(page, email_addr, app_password, imap_host, i
             elif unrecognized_streak % 10 == 0:
                 await page.screenshot(
                     path=_screenshot_path(f"claude_needs_manual_{unrecognized_streak*3}s", email_addr))
-    return True
+    return page
 
 
 async def run_claude_email(mode: str, raw_input: str, is_file: bool):
@@ -1436,14 +1568,16 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
         per_acct_timeout = next(
             (int(a.split("=", 1)[1]) for a in sys.argv[3:]
              if a.startswith("--per-account-timeout=")), 900)
-        for idx, (imap_host, imap_port, email_addr, app_password) in enumerate(accounts, 1):
+        for idx, (imap_host, imap_port, email_addr, app_password,
+                  client_id, refresh_token) in enumerate(accounts, 1):
             logger.info(f"========== [{idx}/{total}] {email_addr} ==========")
             try:
                 done = await asyncio.wait_for(
                     _run_claude_email_single(
                         imap_host, imap_port, email_addr, app_password,
                         delete_after=delete_after, bind_after=bind_after,
-                        admin_token=admin_token, overrides=overrides, interactive=False),
+                        admin_token=admin_token, overrides=overrides, interactive=False,
+                        client_id=client_id, refresh_token=refresh_token),
                     timeout=per_acct_timeout)
                 if done:
                     ok += 1
@@ -1482,19 +1616,23 @@ async def run_claude_email(mode: str, raw_input: str, is_file: bool):
         print("  2) 单行: email----app_password（按域名推断服务器）")
         print("  （批量：直接传文件路径，见 claude-email --help）")
         exit(1)
-    imap_host, imap_port, email_addr, app_password = parsed
+    imap_host, imap_port, email_addr, app_password, client_id, refresh_token = parsed
     await _run_claude_email_single(
         imap_host, imap_port, email_addr, app_password,
         delete_after=delete_after, bind_after=bind_after,
-        admin_token=admin_token, overrides=overrides, interactive=True)
+        admin_token=admin_token, overrides=overrides, interactive=True,
+        client_id=client_id, refresh_token=refresh_token)
 
 
 async def _run_claude_email_single(imap_host, imap_port, email_addr, app_password, *,
                                    delete_after, bind_after, admin_token, overrides,
-                                   interactive=True):
+                                   interactive=True, client_id="", refresh_token=""):
     """对单个账号执行 claude-email / claude-bind 全流程。
 
     interactive=False（批量时）：账号间不暂停等回车，出错由上层捕获后继续下一个。
+
+    client_id + refresh_token：完整卡密里的 Outlook/Hotmail 个人号 OAuth 字段，有则
+    magic-link 登录走 IMAP XOAUTH2 取件（个人号已关密码 IMAP）；无则用 app_password。
     """
     if "yahoo" in imap_host.lower():
         app_password = app_password.replace(" ", "")
@@ -1510,7 +1648,8 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
     # 登录步骤与基准 UID 已下沉到 _claude_email_magic_login，这里不再预抓 UID
 
     # 用持久化 context（按邮箱账号隔离 profile），cookie 跨 tab/跨次复用。
-    # backend 可切：默认 camoufox(Firefox)，--backend patchright 走真 Chrome stealth。
+    # backend 可切：默认 camoufox(Firefox)，--backend patchright 走真 Chrome stealth，
+    # --backend seleniumbase 走 UC 模式真 Chrome 过 Cloudflare 首屏后再由 Patchright 接管。
     _backend = claude_login_backend(overrides.get("backend"))
     logger.info(f"claude 登录内核: {_backend}")
     context, profile_dir, _login_handle = await launch_claude_login_context(
@@ -1529,11 +1668,12 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
 
             # relogin 回调：授权被强制登出（involuntary logout）时，重新 magic-link
             # 登录一次再重试授权。非交互，避免批量时卡在等回车。
-            async def _relogin():
+            async def _relogin(login_page):
                 return await _claude_email_magic_login(
-                    page, email_addr, app_password, imap_host, imap_port,
+                    login_page, email_addr, app_password, imap_host, imap_port,
                     delete_after=delete_after, interactive=False,
-                    skip_landing_goto=True)
+                    client_id=client_id, refresh_token=refresh_token,
+                    skip_landing_goto=True, skip_onboarding=True)
 
             # 0. 已登录检测：该 profile 已登录 claude 则跳过整个邮箱 magic link 登录，
             #    直接提取 sessionKey（并按需加入后台）。
@@ -1551,10 +1691,17 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
                 return success
 
             # 1~7. 邮箱 magic-link 登录（填邮箱 → 抓链接 → 打开 → 推进引导直到 /new）
-            if not await _claude_email_magic_login(
-                    page, email_addr, app_password, imap_host, imap_port,
-                    delete_after=delete_after, interactive=interactive):
+            #    未登录时打开 /new 已被自动跳到登录页，直接在当前页填邮箱，不再重复打开 /login。
+            # magic link 在新 tab 打开，成功后返回该 tab，后续改用它
+            magic_page = await _claude_email_magic_login(
+                page, email_addr, app_password, imap_host, imap_port,
+                delete_after=delete_after, interactive=interactive,
+                client_id=client_id, refresh_token=refresh_token,
+                skip_landing_goto="claude.ai/login" in page.url,
+                skip_onboarding=bind_after)
+            if not magic_page:
                 return False
+            page = magic_page
 
             # 8. 提取 sessionKey（并按需加入后台）
             success = await _claude_extract_session_and_bind(
@@ -1586,10 +1733,6 @@ async def _run_claude_email_single(imap_host, imap_port, email_addr, app_passwor
     finally:
         await close_claude_login_context(_login_handle)
     return success
-
-
-_UUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def _parse_session_bind_targets(raw_input: str, is_file: bool) -> list:
@@ -1626,22 +1769,14 @@ def _parse_session_bind_targets(raw_input: str, is_file: bool) -> list:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # sk 用正则直接定位（key 内含 -- 但不含 ----，不会被字段分隔符截断）
-        m = re.search(r"sk-ant-(?:(?!----)\S)+", line)
-        if not m:
+        fields = _extract_card_fields(line)
+        sk = fields["session_key"]
+        if not sk:
             logger.warning(f"解析失败，跳过（未找到 sk-ant-）: {line[:40]}")
             continue
-        sk = m.group(0)
-        remainder = line[:m.start()] + line[m.end():]
-        parts = [p.strip() for p in remainder.split("----") if p.strip()]
-        email = next((p for p in parts if "@" in p), "")  # 首个含 @ 的即主邮箱
-        client_id = next((p for p in parts if _UUID_RE.match(p)), "")
-        refresh_token = ""
-        if client_id:
-            ci = parts.index(client_id)
-            if ci + 1 < len(parts):  # 令牌紧跟在 ClientId 之后
-                refresh_token = parts[ci + 1]
-        targets.append((email or sk[:16], email, sk, client_id, refresh_token))
+        email = fields["email"]
+        targets.append((email or sk[:16], email, sk,
+                        fields["client_id"], fields["refresh_token"]))
     return targets
 
 
@@ -1782,12 +1917,12 @@ async def _run_claude_bind_session_single(label, email_addr, session_key, *,
             imap_host = _imap_host_for_domain(email_addr.rsplit("@", 1)[-1])
             imap_port = _IMAP_DEFAULT_PORT
 
-            async def relogin():
+            async def relogin(login_page):
                 return await _claude_email_magic_login(
-                    page, email_addr, "", imap_host, imap_port,
+                    login_page, email_addr, "", imap_host, imap_port,
                     delete_after=True, interactive=False,
                     client_id=client_id, refresh_token=refresh_token,
-                    skip_landing_goto=True)
+                    skip_landing_goto=True, skip_onboarding=True)
 
         try:
             success = await _bind_account_to_backend(
